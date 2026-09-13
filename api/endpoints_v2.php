@@ -222,39 +222,54 @@ switch ($action) {
 
     // --- ATTENDANCE RECORDS ---
     case 'get_attendance_records':
+        $user  = requireAuth();
+        $scope = requireKesiswaanScope($db, $user, 'attendance_read');
         $classId  = $_GET['classId']  ?? '';
         $date     = $_GET['date']     ?? date('Y-m-d');
-        $year     = $_GET['year']     ?? '';
-        $semester = $_GET['semester'] ?? '';
+        if (!classInScope($scope, $classId)) errorResponse(KESISWAAN_MSG_KELAS, 403);
 
+        // Parameter year/semester sengaja diabaikan: id record sudah unik per siswa per tanggal,
+        // sedangkan frontend masih mengirim tahun ajaran hardcoded.
         $sql = "SELECT ar.*, s.nisn, s.parent_name, s.parent_phone, JSON_UNQUOTE(JSON_EXTRACT(s.docs_json, '$.pas_foto')) AS pas_foto
                 FROM attendance_records ar
                 LEFT JOIN students s ON s.id = ar.student_id
-                WHERE ar.class_id = ? AND ar.date = ?";
-        $params = [$classId, $date];
-        $types  = "ss";
-
-        if (!empty($year))     { $sql .= " AND ar.academic_year = ?"; $params[] = $year;     $types .= "s"; }
-        if (!empty($semester)) { $sql .= " AND ar.semester = ?";       $params[] = $semester; $types .= "s"; }
-        $sql .= " ORDER BY ar.student_name ASC";
+                WHERE ar.class_id = ? AND ar.date = ?
+                ORDER BY ar.student_name ASC";
 
         $stmt = $db->prepare($sql);
-        $stmt->bind_param($types, ...$params);
+        $stmt->bind_param("ss", $classId, $date);
         $stmt->execute();
         $res = $stmt->get_result();
         $records = [];
-        while ($row = $res->fetch_assoc()) $records[] = $row;
+        while ($row = $res->fetch_assoc()) {
+            // Frontend memakai ALPHA, DB menyimpan ALFA
+            if ($row['status'] === 'ALFA') $row['status'] = 'ALPHA';
+            $records[] = $row;
+        }
         jsonResponse($records);
         break;
 
     case 'save_attendance_records':
-        $user = requireAuth();
-        $body = getRequestBody();
-        $records      = $body['records']       ?? [];
-        $academicYear = $body['academic_year'] ?? '2025/2026';
-        $semester     = $body['semester']      ?? 'GANJIL';
+        $user  = requireAuth();
+        $scope = requireKesiswaanScope($db, $user, 'attendance_write');
+        $body  = getRequestBody();
+        $records = $body['records'] ?? [];
+        // Tahun ajaran & semester selalu dari system_config, nilai body diabaikan
+        [$academicYear, $semester] = activeAcademicPeriod($db);
 
-        if (empty($records)) errorResponse('Data presensi kosong');
+        if (empty($records) || !is_array($records)) errorResponse('Data presensi kosong');
+
+        // Validasi seluruh record sebelum transaksi: satu pelanggaran membatalkan semuanya
+        foreach ($records as $i => $r) {
+            if (!is_array($r) || empty($r['student_id']) || empty($r['date'])) {
+                errorResponse('Data presensi tidak lengkap (student_id dan date wajib diisi)');
+            }
+            if ($scope['mode'] === 'CLASS'
+                && (!classInScope($scope, $r['class_id'] ?? '') || !studentInScope($db, $scope, $r['student_id']))) {
+                errorResponse(KESISWAAN_MSG_KELAS, 403);
+            }
+            $records[$i]['status'] = normalizeAttendanceStatus($r['status'] ?? 'HADIR');
+        }
 
         // Get threshold for auto-parent call
         $resThresh = $db->query("SELECT config_value FROM system_config WHERE config_key = 'violation_threshold_parentcall'");
@@ -354,9 +369,17 @@ switch ($action) {
         break;
 
     case 'get_attendance_summary':
+        $user  = requireAuth();
+        $scope = requireKesiswaanScope($db, $user, 'attendance_read');
+        [$activeYear, $activeSemester] = activeAcademicPeriod($db);
         $classId      = $_GET['classId']  ?? '';
-        $academicYear = $_GET['year']     ?? '2025/2026';
-        $semester     = $_GET['semester'] ?? 'GANJIL';
+        $academicYear = !empty($_GET['year'])     ? $_GET['year']     : $activeYear;
+        $semester     = !empty($_GET['semester']) ? $_GET['semester'] : $activeSemester;
+
+        if ($scope['mode'] === 'CLASS') {
+            if (empty($classId)) $classId = $scope['classId'];
+            if (!classInScope($scope, $classId)) errorResponse(KESISWAAN_MSG_KELAS, 403);
+        }
 
         $sql = "SELECT
                     ar.student_id,
@@ -392,10 +415,13 @@ switch ($action) {
 
     // --- PARENT CALLS (full view) ---
     case 'get_parent_calls':
+        $user  = requireAuth();
+        $scope = requireKesiswaanScope($db, $user, 'parent_call');
         $status = $_GET['status'] ?? '';
         $classId = $_GET['classId'] ?? '';
+        if (!empty($classId) && !classInScope($scope, $classId)) errorResponse(KESISWAAN_MSG_KELAS, 403);
 
-        $sql = "SELECT pc.*, s.parent_name, s.parent_phone, s.nisn
+        $sql = "SELECT pc.*, s.parent_name, s.parent_phone, s.nisn, s.class_id AS scope_student_class_id
                 FROM parent_calls pc
                 LEFT JOIN students s ON s.id = pc.student_id
                 WHERE 1=1";
@@ -411,6 +437,9 @@ switch ($action) {
         $res = $stmt->get_result();
         $calls = [];
         while ($row = $res->fetch_assoc()) {
+            $inScope = parentCallInScope($scope, $row['scope_student_class_id'], $row['class_name']);
+            unset($row['scope_student_class_id']);
+            if (!$inScope) continue;
             $row['total_points'] = (int)$row['total_points'];
             $row['logs'] = !empty($row['logs']) ? json_decode($row['logs'], true) : [];
             $calls[] = $row;
@@ -419,7 +448,8 @@ switch ($action) {
         break;
 
     case 'update_parent_call':
-        $user = requireAuth();
+        $user  = requireAuth();
+        $scope = requireKesiswaanScope($db, $user, 'parent_call');
         $body = getRequestBody();
         $callId  = $body['id']     ?? '';
         $status  = $body['status'] ?? '';
@@ -429,11 +459,18 @@ switch ($action) {
         if (empty($callId) || empty($status)) errorResponse('ID dan status wajib diisi');
 
         // Fetch existing logs
-        $stmtGet = $db->prepare("SELECT logs FROM parent_calls WHERE id = ?");
+        $stmtGet = $db->prepare(
+            "SELECT pc.logs, pc.class_name, s.class_id AS student_class_id
+             FROM parent_calls pc LEFT JOIN students s ON s.id = pc.student_id
+             WHERE pc.id = ?"
+        );
         $stmtGet->bind_param("s", $callId);
         $stmtGet->execute();
         $existing = $stmtGet->get_result()->fetch_assoc();
         if (!$existing) errorResponse('Panggilan tidak ditemukan');
+        if (!parentCallInScope($scope, $existing['student_class_id'], $existing['class_name'])) {
+            errorResponse(KESISWAAN_MSG_KELAS, 403);
+        }
 
         $logs = json_decode($existing['logs'] ?? '[]', true) ?: [];
         $logs[] = [
@@ -454,7 +491,8 @@ switch ($action) {
         break;
 
     case 'save_parent_call_manual':
-        $user = requireAuth();
+        $user  = requireAuth();
+        $scope = requireKesiswaanScope($db, $user, 'parent_call');
         $body = getRequestBody();
         $callId     = 'pcall_' . uniqid();
         $studentId  = $body['student_id']   ?? '';
@@ -466,6 +504,7 @@ switch ($action) {
         $schDate    = $body['scheduled_date']?? null;
 
         if (empty($studentId) || empty($studentName)) errorResponse('Data siswa wajib diisi');
+        if (!studentInScope($db, $scope, $studentId)) errorResponse(KESISWAAN_MSG_KELAS, 403);
 
         // Get current total points
         $res = $db->prepare("SELECT total_violation_points FROM students WHERE id = ?");

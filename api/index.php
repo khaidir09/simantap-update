@@ -34,6 +34,7 @@ simantapLicenseGuard();
 define('SIMANTAP_API', true);
 
 require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/kesiswaan_access.php';
 
 $action = $_GET['action'] ?? '';
 
@@ -761,7 +762,10 @@ switch ($action) {
 
     // --- INCIDENTS ---
     case 'get_incidents':
+        $user  = requireAuth();
+        $scope = requireKesiswaanScope($db, $user, 'incident');
         $classId = $_GET['class'] ?? $_GET['classId'] ?? '';
+        if (!empty($classId) && !classInScope($scope, $classId)) errorResponse(KESISWAAN_MSG_KELAS, 403);
         $rawSemester = $_GET['semester'] ?? '';
         $semester = '';
         if ($rawSemester === '1') $semester = 'GANJIL';
@@ -788,6 +792,8 @@ switch ($action) {
         $res = $db->query($sql);
         $incidents = [];
         while ($row = $res->fetch_assoc()) {
+            // Wali kelas: hanya insiden kelas perwaliannya
+            if (!classInScope($scope, $row['className'])) continue;
             $row['points'] = (int)$row['points'];
             $incidents[] = $row;
         }
@@ -795,16 +801,19 @@ switch ($action) {
         break;
 
     case 'save_incident':
-        $user = requireAuth();
+        $user  = requireAuth();
+        $scope = requireKesiswaanScope($db, $user, 'incident');
         $body = getRequestBody();
 
         $id = $body['id'] ?? uniqid('inc_');
-        
+
         // Check if updating an existing incident
         $checkExisting = $db->query("SELECT * FROM incidents WHERE id = '" . $db->real_escape_string($id) . "'");
         $existing = $checkExisting->fetch_assoc();
 
         if ($existing) {
+            if (!classInScope($scope, $existing['className'])) errorResponse(KESISWAAN_MSG_KELAS, 403);
+
             // Partial Update
             $status = $body['status'] ?? $existing['status'];
             $notes = $body['notes'] ?? $body['actionTaken'] ?? $existing['actionTaken'];
@@ -870,6 +879,13 @@ switch ($action) {
             }
         }
 
+        // Wali kelas: kelas insiden dan kelas siswa harus kelas perwaliannya
+        if ($scope['mode'] === 'CLASS') {
+            $classOk   = classInScope($scope, $classId) || classInScope($scope, $className);
+            $studentOk = empty($studentId) || studentInScope($db, $scope, $studentId);
+            if (!$classOk || !$studentOk) errorResponse(KESISWAAN_MSG_KELAS, 403);
+        }
+
         // Auto-lookup points from violation_types if violation_code given
         if (!empty($violationCode) && $points === 0) {
             $vtRes = $db->prepare("SELECT points FROM violation_types WHERE violation_code = ?");
@@ -928,6 +944,8 @@ switch ($action) {
         break;
 
     case 'delete_incident':
+        $user = requireAuth();
+        requireKesiswaanScope($db, $user, 'incident_delete');
         $id = $_GET['id'] ?? '';
         if (empty($id)) errorResponse('ID wajib disertakan');
 

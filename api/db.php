@@ -12,14 +12,15 @@ if (is_readable(__DIR__ . '/config.local.php')) {
 if (!defined('DB_HOST')) define('DB_HOST', 'localhost');
 if (!defined('DB_USER')) define('DB_USER', 'root');
 if (!defined('DB_PASS')) define('DB_PASS', '');
-if (!defined('DB_NAME')) define('DB_NAME', 'simantap');
+if (!defined('DB_NAME')) define('DB_NAME', 'simantap_prod');
 if (!defined('DB_PORT')) define('DB_PORT', 3306);
 
 // Zona waktu dari konfigurasi installer (default WITA untuk Kalsel)
 if (!defined('APP_TIMEZONE')) define('APP_TIMEZONE', 'Asia/Makassar');
 date_default_timezone_set(APP_TIMEZONE);
 
-function getDB(): mysqli {
+function getDB(): mysqli
+{
     static $conn = null;
     if ($conn === null) {
         // Menggunakan @ untuk menyembunyikan warning bawaan PHP jika koneksi gagal
@@ -33,32 +34,37 @@ function getDB(): mysqli {
     return $conn;
 }
 
-function jsonResponse(mixed $data, int $status = 200): void {
+function jsonResponse(mixed $data, int $status = 200): void
+{
     http_response_code($status);
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
 }
 
-function errorResponse(string $message, int $status = 400): void {
+function errorResponse(string $message, int $status = 400): void
+{
     jsonResponse(['error' => $message], $status);
 }
 
-function getRequestBody(): array {
+function getRequestBody(): array
+{
     $raw = file_get_contents('php://input');
     if (empty($raw)) return [];
     $data = json_decode($raw, true);
     return is_array($data) ? $data : [];
 }
 
-function getCurrentUser(): ?array {
+function getCurrentUser(): ?array
+{
     if (session_status() === PHP_SESSION_NONE) {
         session_start();
     }
     return $_SESSION['user'] ?? null;
 }
 
-function requireAuth(): array {
+function requireAuth(): array
+{
     $user = getCurrentUser();
     if (!$user) {
         errorResponse('Unauthorized', 401);
@@ -66,7 +72,8 @@ function requireAuth(): array {
     return $user;
 }
 
-function requireRole(array $roles): array {
+function requireRole(array $roles): array
+{
     $user = requireAuth();
     if (!in_array($user['role'], $roles)) {
         errorResponse('Forbidden', 403);

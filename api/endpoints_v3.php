@@ -322,7 +322,8 @@ switch ($action) {
     // UPDATE INCIDENT (v2 — mendukung logs, resolved_level, homeroom info)
     // ============================================================
     case 'update_incident_status':
-        $user = requireAuth();
+        $user  = requireAuth();
+        $scope = requireKesiswaanScope($db, $user, 'incident');
         $body = getRequestBody();
         $id            = $body['id']            ?? '';
         $newStatus     = $body['status']        ?? '';
@@ -332,11 +333,12 @@ switch ($action) {
         if (empty($id) || empty($newStatus)) errorResponse('ID dan status wajib diisi');
 
         // Fetch existing logs
-        $stmtGet = $db->prepare("SELECT logs, status FROM incidents WHERE id = ?");
+        $stmtGet = $db->prepare("SELECT logs, status, className FROM incidents WHERE id = ?");
         $stmtGet->bind_param("s", $id);
         $stmtGet->execute();
         $existing = $stmtGet->get_result()->fetch_assoc();
         if (!$existing) errorResponse('Insiden tidak ditemukan');
+        if (!classInScope($scope, $existing['className'])) errorResponse(KESISWAAN_MSG_KELAS, 403);
 
         $logs = json_decode($existing['logs'] ?? '[]', true) ?: [];
         $logs[] = [

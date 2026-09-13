@@ -1,0 +1,504 @@
+<?php
+// endpoints_v2.php - Extended API routes for SIMANTAP
+// Hanya boleh dimuat lewat api/index.php (yang sudah melewati gerbang lisensi)
+if (!defined('SIMANTAP_API')) { http_response_code(403); exit('Forbidden'); }
+
+$action = $_GET['action'] ?? '';
+
+switch ($action) {
+    // --- SUBJECTS ---
+    case 'get_subjects':
+        $res = $db->query("SELECT * FROM subjects WHERE is_active = 1 ORDER BY sort_order ASC, name ASC");
+        $subjects = [];
+        if ($res) {
+            while ($row = $res->fetch_assoc()) {
+                $subjects[] = $row;
+            }
+        }
+        jsonResponse($subjects);
+        break;
+
+    // --- STUDENTS ---
+    case 'get_students':
+        $classId = $_GET['classId'] ?? '';
+        $year = $_GET['year'] ?? '';
+        
+        $sql = "SELECT * FROM students WHERE status = 'AKTIF'";
+        $params = [];
+        $types = "";
+        
+        if (!empty($classId)) {
+            $sql .= " AND class_id = ?";
+            $params[] = $classId;
+            $types .= "s";
+        }
+        if (!empty($year)) {
+            $sql .= " AND academic_year = ?";
+            $params[] = $year;
+            $types .= "s";
+        }
+        $sql .= " ORDER BY class_name ASC, name ASC";
+        
+        $stmt = $db->prepare($sql);
+        if (!empty($params)) {
+            $stmt->bind_param($types, ...$params);
+        }
+        $stmt->execute();
+        $res = $stmt->get_result();
+        
+        $students = [];
+        while ($row = $res->fetch_assoc()) {
+            $row['total_violation_points'] = (int)$row['total_violation_points'];
+            $students[] = $row;
+        }
+        jsonResponse($students);
+        break;
+
+    case 'save_student':
+        requireRole(['ADMIN', 'KEPALA_SEKOLAH', 'TATA_USAHA']);
+        $body = getRequestBody();
+        $id = $body['id'] ?? uniqid('std_');
+        $nisn = $body['nisn'] ?? null;
+        $name = trim($body['name'] ?? '');
+        $classId = $body['class_id'] ?? '';
+        $className = $body['class_name'] ?? '';
+        $year = $body['academic_year'] ?? '2025/2026';
+        $enrollment_year = $body['enrollment_year'] ?? null;
+        $status = $body['status'] ?? 'AKTIF';
+        $parentName = $body['parent_name'] ?? null;
+        $parentPhone = $body['parent_phone'] ?? null;
+        
+        if (empty($name) || empty($classId)) {
+            errorResponse('Nama dan Kelas wajib diisi');
+        }
+        
+        $stmt = $db->prepare("INSERT INTO students (id, nisn, name, class_id, class_name, academic_year, enrollment_year, status, parent_name, parent_phone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE nisn=VALUES(nisn), name=VALUES(name), class_id=VALUES(class_id), class_name=VALUES(class_name), academic_year=VALUES(academic_year), enrollment_year=VALUES(enrollment_year), status=VALUES(status), parent_name=VALUES(parent_name), parent_phone=VALUES(parent_phone)");
+        $stmt->bind_param("ssssssssss", $id, $nisn, $name, $classId, $className, $year, $enrollment_year, $status, $parentName, $parentPhone);
+        if ($stmt->execute()) {
+            jsonResponse(['success' => true, 'id' => $id]);
+        } else {
+            errorResponse('Gagal menyimpan siswa');
+        }
+        break;
+
+    case 'delete_student':
+        requireRole(['ADMIN', 'TATA_USAHA']);
+        $id = $_GET['id'] ?? '';
+        if (empty($id)) errorResponse('ID wajib diisi');
+        $stmt = $db->prepare("DELETE FROM students WHERE id = ?");
+        $stmt->bind_param("s", $id);
+        if ($stmt->execute()) jsonResponse(['success' => true]);
+        else errorResponse('Gagal menghapus siswa');
+        break;
+
+    case 'import_students':
+        requireRole(['ADMIN', 'TATA_USAHA']);
+        $body = getRequestBody();
+        $students = $body['students'] ?? [];
+        $year = $body['academic_year'] ?? '2025/2026';
+
+        if (empty($students)) errorResponse('Data siswa kosong');
+
+        // Validasi format tahun ajaran
+        if (!preg_match('/^\d{4}\/\d{4}$/', $year)) {
+            errorResponse('Format tahun ajaran tidak valid. Gunakan format YYYY/YYYY');
+        }
+
+        $db->begin_transaction();
+        try {
+            // Sertakan enrollment_year agar data tahun masuk tersimpan
+            $stmt = $db->prepare(
+                "INSERT INTO students (id, nisn, name, class_id, class_name, academic_year, enrollment_year)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE
+                   name=VALUES(name), class_id=VALUES(class_id), class_name=VALUES(class_name),
+                   academic_year=VALUES(academic_year), enrollment_year=VALUES(enrollment_year)"
+            );
+
+            foreach ($students as $s) {
+                $id = !empty($s['nisn']) ? 'std_' . $s['nisn'] : uniqid('std_');
+                $nisn = $s['nisn'] ?? null;
+                $name = $s['name'] ?? '';
+                $className = $s['kelas'] ?? 'Umum';
+                $classId = str_replace(' ', '_', strtoupper($className));
+
+                // Ambil tahun pertama dari academic_year sebagai enrollment_year (misal 2025/2026 -> 2025)
+                $enrollYear = explode('/', $year)[0];
+
+                $stmt->bind_param("sssssss", $id, $nisn, $name, $classId, $className, $year, $enrollYear);
+                $stmt->execute();
+            }
+            $db->commit();
+            jsonResponse(['success' => true, 'count' => count($students)]);
+        } catch (Exception $e) {
+            $db->rollback();
+            errorResponse('Import gagal: ' . $e->getMessage());
+        }
+        break;
+
+    // --- VIOLATION TYPES ---
+    case 'get_violation_types':
+        $res = $db->query("SELECT * FROM violation_types ORDER BY category DESC, points DESC");
+        $types = [];
+        while ($row = $res->fetch_assoc()) {
+            $row['points'] = (int)$row['points'];
+            $row['auto_parent_call'] = (bool)$row['auto_parent_call'];
+            $types[] = $row;
+        }
+        jsonResponse($types);
+        break;
+        
+    case 'save_violation_type':
+        requireRole(['ADMIN']);
+        $body = getRequestBody();
+        $code = $body['violation_code'] ?? '';
+        $name = $body['violation_name'] ?? '';
+        $points = (int)($body['points'] ?? 10);
+        $category = $body['category'] ?? 'RINGAN';
+        $desc = $body['description'] ?? '';
+        $auto = (int)($body['auto_parent_call'] ?? 0);
+        
+        if (empty($code) || empty($name)) errorResponse('Kode dan Nama wajib diisi');
+        
+        $stmt = $db->prepare("INSERT INTO violation_types (violation_code, violation_name, points, category, description, auto_parent_call) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE violation_name=VALUES(violation_name), points=VALUES(points), category=VALUES(category), description=VALUES(description), auto_parent_call=VALUES(auto_parent_call)");
+        $stmt->bind_param("ssissi", $code, $name, $points, $category, $desc, $auto);
+        
+        if ($stmt->execute()) jsonResponse(['success' => true]);
+        else errorResponse('Gagal menyimpan jenis pelanggaran');
+        break;
+
+    case 'delete_violation_type':
+        requireRole(['ADMIN']);
+        $code = $_GET['code'] ?? '';
+        $stmt = $db->prepare("DELETE FROM violation_types WHERE violation_code = ?");
+        $stmt->bind_param("s", $code);
+        if ($stmt->execute()) jsonResponse(['success' => true]);
+        else errorResponse('Gagal menghapus');
+        break;
+
+    // --- CONFIG & SYSTEM ---
+    case 'get_config':
+        $res = $db->query("SELECT * FROM system_config");
+        $config = [];
+        while ($row = $res->fetch_assoc()) {
+            $config[$row['config_key']] = $row['config_value'];
+        }
+        jsonResponse($config);
+        break;
+
+    case 'save_config':
+        requireRole(['ADMIN']);
+        $body = getRequestBody();
+        $key = $body['config_key'] ?? '';
+        $val = $body['config_value'] ?? '';
+        
+        if(empty($key)) errorResponse('Key required');
+        
+        $stmt = $db->prepare("UPDATE system_config SET config_value = ? WHERE config_key = ?");
+        $stmt->bind_param("ss", $val, $key);
+        if ($stmt->execute()) jsonResponse(['success' => true]);
+        else errorResponse('Failed');
+        break;
+        
+    // --- PARENT CALLS ---
+    case 'save_parent_call':
+        $user = requireAuth();
+        $body = getRequestBody();
+        $id = $body['id'] ?? uniqid('pcall_');
+        $studentId = $body['student_id'] ?? '';
+        $studentName = $body['student_name'] ?? '';
+        $status = $body['status'] ?? 'PARENT_INVITED';
+        $notes = $body['notes'] ?? '';
+        $handledBy = $user['uid'];
+        $handlerName = $user['displayName'];
+        
+        // This is usually an update to existing call status
+        $stmt = $db->prepare("UPDATE parent_calls SET status = ?, notes = ?, handled_by = ?, handler_name = ? WHERE id = ?");
+        $stmt->bind_param("sssss", $status, $notes, $handledBy, $handlerName, $id);
+        if ($stmt->execute()) jsonResponse(['success' => true]);
+        else errorResponse('Gagal update');
+        break;
+        
+
+    // --- ATTENDANCE RECORDS ---
+    case 'get_attendance_records':
+        $classId  = $_GET['classId']  ?? '';
+        $date     = $_GET['date']     ?? date('Y-m-d');
+        $year     = $_GET['year']     ?? '';
+        $semester = $_GET['semester'] ?? '';
+
+        $sql = "SELECT ar.*, s.nisn, s.parent_name, s.parent_phone, JSON_UNQUOTE(JSON_EXTRACT(s.docs_json, '$.pas_foto')) AS pas_foto
+                FROM attendance_records ar
+                LEFT JOIN students s ON s.id = ar.student_id
+                WHERE ar.class_id = ? AND ar.date = ?";
+        $params = [$classId, $date];
+        $types  = "ss";
+
+        if (!empty($year))     { $sql .= " AND ar.academic_year = ?"; $params[] = $year;     $types .= "s"; }
+        if (!empty($semester)) { $sql .= " AND ar.semester = ?";       $params[] = $semester; $types .= "s"; }
+        $sql .= " ORDER BY ar.student_name ASC";
+
+        $stmt = $db->prepare($sql);
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $records = [];
+        while ($row = $res->fetch_assoc()) $records[] = $row;
+        jsonResponse($records);
+        break;
+
+    case 'save_attendance_records':
+        $user = requireAuth();
+        $body = getRequestBody();
+        $records      = $body['records']       ?? [];
+        $academicYear = $body['academic_year'] ?? '2025/2026';
+        $semester     = $body['semester']      ?? 'GANJIL';
+
+        if (empty($records)) errorResponse('Data presensi kosong');
+
+        // Get threshold for auto-parent call
+        $resThresh = $db->query("SELECT config_value FROM system_config WHERE config_key = 'violation_threshold_parentcall'");
+        $threshRow = $resThresh->fetch_assoc();
+        $threshold = (int)($threshRow['config_value'] ?? 75);
+
+        // Get ALFA violation points
+        $resAlfa = $db->query("SELECT points FROM violation_types WHERE violation_code = 'ALFA'");
+        $alfaRow = $resAlfa ? $resAlfa->fetch_assoc() : null;
+        $alfaPoints = (int)($alfaRow['points'] ?? 15);
+
+        $db->begin_transaction();
+        try {
+            $stmtUpsert = $db->prepare(
+                "INSERT INTO attendance_records
+                    (id, student_id, student_name, class_id, class_name, date, semester, academic_year, status, recorded_by, recorder_name, source)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL')
+                 ON DUPLICATE KEY UPDATE
+                    status = VALUES(status),
+                    recorded_by = VALUES(recorded_by),
+                    recorder_name = VALUES(recorder_name),
+                    source = 'MANUAL'"
+            );
+
+            foreach ($records as $r) {
+                $rId          = 'att_' . $r['student_id'] . '_' . $r['date'];
+                $studentId    = $r['student_id'];
+                $studentName  = $r['student_name'];
+                $classId      = $r['class_id'];
+                $className    = $r['class_name'];
+                $date         = $r['date'];
+                $status       = $r['status'] ?? 'HADIR';
+                $recordedBy   = $user['uid'];
+                $recorderName = $user['displayName'];
+
+                $stmtUpsert->bind_param(
+                    "sssssssssss",
+                    $rId, $studentId, $studentName, $classId, $className,
+                    $date, $semester, $academicYear, $status, $recordedBy, $recorderName
+                );
+                $stmtUpsert->execute();
+
+                // Auto-trigger violation for ALFA
+                $incId = 'inc_att_' . $studentId . '_' . $date;
+                if ($status === 'ALFA') {
+                    $checkInc = $db->query("SELECT id FROM incidents WHERE id = '$incId'");
+                    if ($checkInc->num_rows === 0) {
+                        $getNisn = $db->query("SELECT nisn FROM students WHERE id = '" . $db->real_escape_string($studentId) . "'");
+                        $sInfo = $getNisn->fetch_assoc();
+                        $studentNisn = $sInfo ? $sInfo['nisn'] : null;
+                        
+                        $details = "Tidak hadir tanpa keterangan (dari presensi $date)";
+                        $stmtInc = $db->prepare(
+                            "INSERT INTO incidents (id, type, date, studentId, student_nisn, studentName, className, academic_year, semester, reporterId, reporterName, details, violation_code, points, status, parent_call_triggered)
+                             VALUES (?, 'VIOLATION', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ALFA', ?, 'REPORTED', 0)"
+                        );
+                        $stmtInc->bind_param(
+                            "sssssssssssi",
+                            $incId, $date, $studentId, $studentNisn, $studentName, $className, $academicYear, $semester,
+                            $user['uid'], $user['displayName'], $details, $alfaPoints
+                        );
+                        $stmtInc->execute();
+
+                        // Update total_violation_points
+                        $db->query("UPDATE students SET total_violation_points = total_violation_points + $alfaPoints WHERE id = '" . $db->real_escape_string($studentId) . "'");
+
+                        // Check threshold
+                        $res2 = $db->query("SELECT total_violation_points, name, class_name FROM students WHERE id = '" . $db->real_escape_string($studentId) . "'");
+                        $sRow = $res2->fetch_assoc();
+                        $totalPts = (int)($sRow['total_violation_points'] ?? 0);
+
+                        if ($totalPts >= $threshold) {
+                            $callId = 'pcall_' . $studentId . '_' . time();
+                            $stmtCall = $db->prepare(
+                                "INSERT IGNORE INTO parent_calls (id, student_id, student_name, class_name, academic_year, semester, total_points, trigger_type, trigger_incident_id, status)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, 'AUTO', ?, 'PARENT_INVITED')"
+                            );
+                            $stmtCall->bind_param("ssssssis", $callId, $studentId, $studentName, $className, $academicYear, $semester, $totalPts, $incId);
+                            $stmtCall->execute();
+                        }
+                    }
+                } else {
+                    $checkInc = $db->query("SELECT id FROM incidents WHERE id = '$incId'");
+                    if ($checkInc->num_rows > 0) {
+                        $db->query("DELETE FROM incidents WHERE id = '$incId'");
+                        $db->query("UPDATE students SET total_violation_points = GREATEST(0, total_violation_points - $alfaPoints) WHERE id = '" . $db->real_escape_string($studentId) . "'");
+                    }
+                }
+            }
+
+            $db->commit();
+            jsonResponse(['success' => true, 'count' => count($records)]);
+        } catch (Exception $e) {
+            $db->rollback();
+            errorResponse('Gagal simpan presensi: ' . $e->getMessage());
+        }
+        break;
+
+    case 'get_attendance_summary':
+        $classId      = $_GET['classId']  ?? '';
+        $academicYear = $_GET['year']     ?? '2025/2026';
+        $semester     = $_GET['semester'] ?? 'GANJIL';
+
+        $sql = "SELECT
+                    ar.student_id,
+                    ar.student_name,
+                    ar.class_name,
+                    SUM(CASE WHEN ar.status='HADIR' THEN 1 ELSE 0 END) AS total_hadir,
+                    SUM(CASE WHEN ar.status='SAKIT' THEN 1 ELSE 0 END) AS total_sakit,
+                    SUM(CASE WHEN ar.status='IZIN'  THEN 1 ELSE 0 END) AS total_izin,
+                    SUM(CASE WHEN ar.status='ALFA'  THEN 1 ELSE 0 END) AS total_alfa,
+                    COUNT(*) AS total_hari
+                FROM attendance_records ar
+                WHERE ar.academic_year = ? AND ar.semester = ?";
+        $params = [$academicYear, $semester];
+        $types  = "ss";
+        if (!empty($classId)) { $sql .= " AND ar.class_id = ?"; $params[] = $classId; $types .= "s"; }
+        $sql .= " GROUP BY ar.student_id, ar.student_name, ar.class_name ORDER BY ar.student_name ASC";
+
+        $stmt = $db->prepare($sql);
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $summary = [];
+        while ($row = $res->fetch_assoc()) {
+            $row['total_hadir']  = (int)$row['total_hadir'];
+            $row['total_sakit']  = (int)$row['total_sakit'];
+            $row['total_izin']   = (int)$row['total_izin'];
+            $row['total_alfa']   = (int)$row['total_alfa'];
+            $row['total_hari']   = (int)$row['total_hari'];
+            $summary[] = $row;
+        }
+        jsonResponse($summary);
+        break;
+
+    // --- PARENT CALLS (full view) ---
+    case 'get_parent_calls':
+        $status = $_GET['status'] ?? '';
+        $classId = $_GET['classId'] ?? '';
+
+        $sql = "SELECT pc.*, s.parent_name, s.parent_phone, s.nisn
+                FROM parent_calls pc
+                LEFT JOIN students s ON s.id = pc.student_id
+                WHERE 1=1";
+        $params = [];
+        $types  = "";
+        if (!empty($status))  { $sql .= " AND pc.status = ?";   $params[] = $status;  $types .= "s"; }
+        if (!empty($classId)) { $sql .= " AND pc.student_id IN (SELECT id FROM students WHERE class_id = ?)"; $params[] = $classId; $types .= "s"; }
+        $sql .= " ORDER BY pc.created_at DESC";
+
+        $stmt = $db->prepare($sql);
+        if (!empty($params)) $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $calls = [];
+        while ($row = $res->fetch_assoc()) {
+            $row['total_points'] = (int)$row['total_points'];
+            $row['logs'] = !empty($row['logs']) ? json_decode($row['logs'], true) : [];
+            $calls[] = $row;
+        }
+        jsonResponse($calls);
+        break;
+
+    case 'update_parent_call':
+        $user = requireAuth();
+        $body = getRequestBody();
+        $callId  = $body['id']     ?? '';
+        $status  = $body['status'] ?? '';
+        $notes   = $body['notes']  ?? '';
+        $schDate = $body['scheduled_date'] ?? null;
+
+        if (empty($callId) || empty($status)) errorResponse('ID dan status wajib diisi');
+
+        // Fetch existing logs
+        $stmtGet = $db->prepare("SELECT logs FROM parent_calls WHERE id = ?");
+        $stmtGet->bind_param("s", $callId);
+        $stmtGet->execute();
+        $existing = $stmtGet->get_result()->fetch_assoc();
+        if (!$existing) errorResponse('Panggilan tidak ditemukan');
+
+        $logs = json_decode($existing['logs'] ?? '[]', true) ?: [];
+        $logs[] = [
+            'status'    => $status,
+            'actorName' => $user['displayName'],
+            'actorRole' => $user['role'],
+            'timestamp' => date('Y-m-d H:i:s'),
+            'comment'   => $notes ?: "Status diubah ke $status",
+        ];
+        $logsJson = json_encode($logs);
+
+        $stmt = $db->prepare(
+            "UPDATE parent_calls SET status = ?, logs = ?, notes = ?, scheduled_date = ?, handled_by = ?, handler_name = ?, updated_at = NOW() WHERE id = ?"
+        );
+        $stmt->bind_param("sssssss", $status, $logsJson, $notes, $schDate, $user['uid'], $user['displayName'], $callId);
+        if ($stmt->execute()) jsonResponse(['success' => true, 'logs' => $logs]);
+        else errorResponse('Gagal update panggilan');
+        break;
+
+    case 'save_parent_call_manual':
+        $user = requireAuth();
+        $body = getRequestBody();
+        $callId     = 'pcall_' . uniqid();
+        $studentId  = $body['student_id']   ?? '';
+        $studentName= $body['student_name'] ?? '';
+        $className  = $body['class_name']   ?? '';
+        $year       = $body['academic_year']?? '2025/2026';
+        $semester   = $body['semester']     ?? 'GANJIL';
+        $notes      = $body['notes']        ?? '';
+        $schDate    = $body['scheduled_date']?? null;
+
+        if (empty($studentId) || empty($studentName)) errorResponse('Data siswa wajib diisi');
+
+        // Get current total points
+        $res = $db->prepare("SELECT total_violation_points FROM students WHERE id = ?");
+        $res->bind_param("s", $studentId);
+        $res->execute();
+        $sRow = $res->get_result()->fetch_assoc();
+        $totalPts = (int)($sRow['total_violation_points'] ?? 0);
+
+        // Initialize logs
+        $logs = [[
+            'status'    => 'PARENT_INVITED',
+            'actorName' => $user['displayName'],
+            'actorRole' => $user['role'],
+            'timestamp' => date('Y-m-d H:i:s'),
+            'comment'   => $notes ?: "Panggilan Orang Tua Dibuat",
+        ]];
+        $logsJson = json_encode($logs);
+
+        $stmt = $db->prepare(
+            "INSERT INTO parent_calls (id, student_id, student_name, class_name, academic_year, semester, total_points, trigger_type, status, logs, notes, scheduled_date, handled_by, handler_name)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'MANUAL', 'PARENT_INVITED', ?, ?, ?, ?, ?)"
+        );
+        $stmt->bind_param("ssssssisssss", $callId, $studentId, $studentName, $className, $year, $semester, $totalPts, $logsJson, $notes, $schDate, $user['uid'], $user['displayName']);
+        if ($stmt->execute()) jsonResponse(['success' => true, 'id' => $callId, 'logs' => $logs]);
+        else errorResponse('Gagal membuat panggilan ortu');
+        break;
+
+
+
+    default:
+        // Fallback to endpoints_v3.php
+        $handled = require __DIR__ . '/endpoints_v3.php';
+        if (!$handled) return false;
+        break;
+}
+return true; // Handled

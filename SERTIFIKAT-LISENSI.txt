@@ -1,0 +1,22 @@
+==========================================================
+   SERTIFIKAT DISTRIBUSI APLIKASI SIMANTAP
+   BTIKP Dinas Pendidikan & Kebudayaan Prov. Kalsel
+==========================================================
+
+Bundle aplikasi ini diterbitkan secara resmi dan KHUSUS untuk:
+
+  Nama Sekolah   : SMK Negeri 1 Amuntai
+  NPSN           : 30302536
+  Kabupaten/Kota : HSU
+  Versi Aplikasi : 1.0.2
+  Diterbitkan    : 06-09-2026 14:29:38 WITA
+  ID Distribusi  : 9E8DC8FBF4
+
+Bundle ini terikat pada sekolah di atas dan TIDAK BOLEH
+disalin, dibagikan, atau dipasang untuk pihak lain.
+Setiap bundle memiliki penanda distribusi unik yang dapat
+dilacak kembali ke sekolah penerima.
+
+Pelanggaran terhadap ketentuan penggunaan dapat dikenakan
+sanksi sesuai perjanjian registrasi Portal SIMANTAP.
+==========================================================

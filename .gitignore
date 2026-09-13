@@ -1,0 +1,15 @@
+# State runtime yang dibuat installer / aplikasi (berisi kredensial & lisensi per server)
+api/config.local.php
+api/license.json
+api/install.lock
+api/.heartbeat
+api/.license_revoked
+api/.update_available
+api/.updating
+api/patch_tmp/
+api/backups/
+
+# File unggahan pengguna (hanya pertahankan index.html pelindung direktori)
+uploads/**
+!uploads/*/
+!uploads/*/index.html

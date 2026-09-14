@@ -87,6 +87,9 @@ switch ($action) {
                 }
             }
 
+            // Nama kelas perwalian untuk tampilan (class_homeroom tetap id kelas)
+            $user['class_homeroom_name'] = !empty($user['class_homeroom']) ? resolveClassRef($db, $user['class_homeroom'])['name'] : '';
+
             $_SESSION['user'] = $user;
             jsonResponse(['user' => $user]);
         } else {
@@ -122,6 +125,8 @@ switch ($action) {
                     $_SESSION['user'] = $user;
                 }
             }
+            // Nama kelas perwalian untuk tampilan (class_homeroom tetap id kelas)
+            $user['class_homeroom_name'] = !empty($user['class_homeroom']) ? resolveClassRef($db, $user['class_homeroom'])['name'] : '';
         }
         jsonResponse(['user' => $user]);
         break;
@@ -776,7 +781,7 @@ switch ($action) {
         if (!empty($classId)) {
             $cleanClass = preg_replace('/[\s\-_.]/', '', strtolower($classId));
             $safeCleanClass = $db->real_escape_string($cleanClass);
-            $conditions[] = "(LOWER(REPLACE(REPLACE(REPLACE(i.className, ' ', ''), '-', ''), '.', '')) = '$safeCleanClass')";
+            $conditions[] = "(LOWER(REPLACE(REPLACE(REPLACE(REPLACE(i.className, ' ', ''), '_', ''), '-', ''), '.', '')) = '$safeCleanClass')";
         }
         if (!empty($semester)) {
             $conditions[] = "i.semester = '" . $db->real_escape_string($semester) . "'";

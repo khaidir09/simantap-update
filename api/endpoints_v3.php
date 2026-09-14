@@ -27,9 +27,10 @@ switch ($action) {
     // GET_CLASS_ATTENDANCE_SUMMARY — Rekap presensi per bulan untuk wali kelas
     // ============================================================
     case 'get_class_attendance_summary':
-        $classId      = $_GET['class_id']  ?? '';
-        $academicYear = $_GET['year']      ?? '2025/2026';
-        $rawSemester  = $_GET['semester']  ?? '1';
+        [$activeYear, $activeSemester] = activeAcademicPeriod($db);
+        $classId      = resolveClassRef($db, $_GET['class_id'] ?? '')['id'];
+        $academicYear = trim((string)($_GET['year'] ?? '')) ?: $activeYear;
+        $rawSemester  = trim((string)($_GET['semester'] ?? '')) ?: $activeSemester;
         $semester     = ($rawSemester === '1' || strtoupper($rawSemester) === 'GANJIL') ? 'GANJIL' : 'GENAP';
         $month        = $_GET['month']     ?? '';
 
@@ -77,9 +78,13 @@ switch ($action) {
     // GET_HOMEROOM_DASHBOARD — Summary lengkap untuk dashboard wali kelas
     // ============================================================
     case 'get_homeroom_dashboard':
-        $classId      = $_GET['class_id']  ?? '';
-        $academicYear = $_GET['year']      ?? '2025/2026';
-        $rawSemester  = $_GET['semester']  ?? '1';
+        // Frontend mengirim class_homeroom (mis. "X-AKT-1") tanpa tahun ajaran,
+        // padahal presensi disimpan dengan classes.id ("X_AKT_1") dan tahun ajaran aktif.
+        [$activeYear, $activeSemester] = activeAcademicPeriod($db);
+        $classRef     = resolveClassRef($db, $_GET['class_id'] ?? '');
+        $classId      = $classRef['id'];
+        $academicYear = trim((string)($_GET['year'] ?? '')) ?: $activeYear;
+        $rawSemester  = trim((string)($_GET['semester'] ?? '')) ?: $activeSemester;
         $semester     = ($rawSemester === '1' || strtoupper($rawSemester) === 'GANJIL') ? 'GANJIL' : 'GENAP';
         if (empty($classId)) { jsonResponse([]); break; }
 
@@ -119,9 +124,13 @@ switch ($action) {
             $perSiswa[] = $row;
         }
 
-        // Total poin pelanggaran kelas
-        $stmtV = $db->prepare("SELECT COALESCE(SUM(points),0) AS total FROM incidents WHERE className = ? AND status != 'REJECTED'");
-        $stmtV->bind_param("s", $classId);
+        // Total poin pelanggaran kelas (incidents.className menyimpan nama kelas, cocokkan via kunci)
+        $stmtV = $db->prepare("SELECT COALESCE(SUM(points),0) AS total FROM incidents
+            WHERE REPLACE(REPLACE(REPLACE(REPLACE(LOWER(className), ' ', ''), '_', ''), '-', ''), '.', '') IN (?, ?)
+              AND status != 'REJECTED'");
+        $keyId   = normalizeClassKey($classRef['id']);
+        $keyName = normalizeClassKey($classRef['name']);
+        $stmtV->bind_param("ss", $keyId, $keyName);
         $stmtV->execute();
         $totalPoin = (int)$stmtV->get_result()->fetch_assoc()['total'];
 

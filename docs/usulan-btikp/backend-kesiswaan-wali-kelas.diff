@@ -1,0 +1,432 @@
+diff --git a/api/endpoints_v2.php b/api/endpoints_v2.php
+index 0f265c0..741b253 100644
+--- a/api/endpoints_v2.php
++++ b/api/endpoints_v2.php
+@@ -222,39 +222,54 @@ switch ($action) {
+ 
+     // --- ATTENDANCE RECORDS ---
+     case 'get_attendance_records':
++        $user  = requireAuth();
++        $scope = requireKesiswaanScope($db, $user, 'attendance_read');
+         $classId  = $_GET['classId']  ?? '';
+         $date     = $_GET['date']     ?? date('Y-m-d');
+-        $year     = $_GET['year']     ?? '';
+-        $semester = $_GET['semester'] ?? '';
++        if (!classInScope($scope, $classId)) errorResponse(KESISWAAN_MSG_KELAS, 403);
+ 
++        // Parameter year/semester sengaja diabaikan: id record sudah unik per siswa per tanggal,
++        // sedangkan frontend masih mengirim tahun ajaran hardcoded.
+         $sql = "SELECT ar.*, s.nisn, s.parent_name, s.parent_phone, JSON_UNQUOTE(JSON_EXTRACT(s.docs_json, '$.pas_foto')) AS pas_foto
+                 FROM attendance_records ar
+                 LEFT JOIN students s ON s.id = ar.student_id
+-                WHERE ar.class_id = ? AND ar.date = ?";
+-        $params = [$classId, $date];
+-        $types  = "ss";
+-
+-        if (!empty($year))     { $sql .= " AND ar.academic_year = ?"; $params[] = $year;     $types .= "s"; }
+-        if (!empty($semester)) { $sql .= " AND ar.semester = ?";       $params[] = $semester; $types .= "s"; }
+-        $sql .= " ORDER BY ar.student_name ASC";
++                WHERE ar.class_id = ? AND ar.date = ?
++                ORDER BY ar.student_name ASC";
+ 
+         $stmt = $db->prepare($sql);
+-        $stmt->bind_param($types, ...$params);
++        $stmt->bind_param("ss", $classId, $date);
+         $stmt->execute();
+         $res = $stmt->get_result();
+         $records = [];
+-        while ($row = $res->fetch_assoc()) $records[] = $row;
++        while ($row = $res->fetch_assoc()) {
++            // Frontend memakai ALPHA, DB menyimpan ALFA
++            if ($row['status'] === 'ALFA') $row['status'] = 'ALPHA';
++            $records[] = $row;
++        }
+         jsonResponse($records);
+         break;
+ 
+     case 'save_attendance_records':
+-        $user = requireAuth();
+-        $body = getRequestBody();
+-        $records      = $body['records']       ?? [];
+-        $academicYear = $body['academic_year'] ?? '2025/2026';
+-        $semester     = $body['semester']      ?? 'GANJIL';
+-
+-        if (empty($records)) errorResponse('Data presensi kosong');
++        $user  = requireAuth();
++        $scope = requireKesiswaanScope($db, $user, 'attendance_write');
++        $body  = getRequestBody();
++        $records = $body['records'] ?? [];
++        // Tahun ajaran & semester selalu dari system_config, nilai body diabaikan
++        [$academicYear, $semester] = activeAcademicPeriod($db);
++
++        if (empty($records) || !is_array($records)) errorResponse('Data presensi kosong');
++
++        // Validasi seluruh record sebelum transaksi: satu pelanggaran membatalkan semuanya
++        foreach ($records as $i => $r) {
++            if (!is_array($r) || empty($r['student_id']) || empty($r['date'])) {
++                errorResponse('Data presensi tidak lengkap (student_id dan date wajib diisi)');
++            }
++            if ($scope['mode'] === 'CLASS'
++                && (!classInScope($scope, $r['class_id'] ?? '') || !studentInScope($db, $scope, $r['student_id']))) {
++                errorResponse(KESISWAAN_MSG_KELAS, 403);
++            }
++            $records[$i]['status'] = normalizeAttendanceStatus($r['status'] ?? 'HADIR');
++        }
+ 
+         // Get threshold for auto-parent call
+         $resThresh = $db->query("SELECT config_value FROM system_config WHERE config_key = 'violation_threshold_parentcall'");
+@@ -354,9 +369,17 @@ switch ($action) {
+         break;
+ 
+     case 'get_attendance_summary':
++        $user  = requireAuth();
++        $scope = requireKesiswaanScope($db, $user, 'attendance_read');
++        [$activeYear, $activeSemester] = activeAcademicPeriod($db);
+         $classId      = $_GET['classId']  ?? '';
+-        $academicYear = $_GET['year']     ?? '2025/2026';
+-        $semester     = $_GET['semester'] ?? 'GANJIL';
++        $academicYear = !empty($_GET['year'])     ? $_GET['year']     : $activeYear;
++        $semester     = !empty($_GET['semester']) ? $_GET['semester'] : $activeSemester;
++
++        if ($scope['mode'] === 'CLASS') {
++            if (empty($classId)) $classId = $scope['classId'];
++            if (!classInScope($scope, $classId)) errorResponse(KESISWAAN_MSG_KELAS, 403);
++        }
+ 
+         $sql = "SELECT
+                     ar.student_id,
+@@ -392,10 +415,13 @@ switch ($action) {
+ 
+     // --- PARENT CALLS (full view) ---
+     case 'get_parent_calls':
++        $user  = requireAuth();
++        $scope = requireKesiswaanScope($db, $user, 'parent_call');
+         $status = $_GET['status'] ?? '';
+         $classId = $_GET['classId'] ?? '';
++        if (!empty($classId) && !classInScope($scope, $classId)) errorResponse(KESISWAAN_MSG_KELAS, 403);
+ 
+-        $sql = "SELECT pc.*, s.parent_name, s.parent_phone, s.nisn
++        $sql = "SELECT pc.*, s.parent_name, s.parent_phone, s.nisn, s.class_id AS scope_student_class_id
+                 FROM parent_calls pc
+                 LEFT JOIN students s ON s.id = pc.student_id
+                 WHERE 1=1";
+@@ -411,6 +437,9 @@ switch ($action) {
+         $res = $stmt->get_result();
+         $calls = [];
+         while ($row = $res->fetch_assoc()) {
++            $inScope = parentCallInScope($scope, $row['scope_student_class_id'], $row['class_name']);
++            unset($row['scope_student_class_id']);
++            if (!$inScope) continue;
+             $row['total_points'] = (int)$row['total_points'];
+             $row['logs'] = !empty($row['logs']) ? json_decode($row['logs'], true) : [];
+             $calls[] = $row;
+@@ -419,7 +448,8 @@ switch ($action) {
+         break;
+ 
+     case 'update_parent_call':
+-        $user = requireAuth();
++        $user  = requireAuth();
++        $scope = requireKesiswaanScope($db, $user, 'parent_call');
+         $body = getRequestBody();
+         $callId  = $body['id']     ?? '';
+         $status  = $body['status'] ?? '';
+@@ -429,11 +459,18 @@ switch ($action) {
+         if (empty($callId) || empty($status)) errorResponse('ID dan status wajib diisi');
+ 
+         // Fetch existing logs
+-        $stmtGet = $db->prepare("SELECT logs FROM parent_calls WHERE id = ?");
++        $stmtGet = $db->prepare(
++            "SELECT pc.logs, pc.class_name, s.class_id AS student_class_id
++             FROM parent_calls pc LEFT JOIN students s ON s.id = pc.student_id
++             WHERE pc.id = ?"
++        );
+         $stmtGet->bind_param("s", $callId);
+         $stmtGet->execute();
+         $existing = $stmtGet->get_result()->fetch_assoc();
+         if (!$existing) errorResponse('Panggilan tidak ditemukan');
++        if (!parentCallInScope($scope, $existing['student_class_id'], $existing['class_name'])) {
++            errorResponse(KESISWAAN_MSG_KELAS, 403);
++        }
+ 
+         $logs = json_decode($existing['logs'] ?? '[]', true) ?: [];
+         $logs[] = [
+@@ -454,7 +491,8 @@ switch ($action) {
+         break;
+ 
+     case 'save_parent_call_manual':
+-        $user = requireAuth();
++        $user  = requireAuth();
++        $scope = requireKesiswaanScope($db, $user, 'parent_call');
+         $body = getRequestBody();
+         $callId     = 'pcall_' . uniqid();
+         $studentId  = $body['student_id']   ?? '';
+@@ -466,6 +504,7 @@ switch ($action) {
+         $schDate    = $body['scheduled_date']?? null;
+ 
+         if (empty($studentId) || empty($studentName)) errorResponse('Data siswa wajib diisi');
++        if (!studentInScope($db, $scope, $studentId)) errorResponse(KESISWAAN_MSG_KELAS, 403);
+ 
+         // Get current total points
+         $res = $db->prepare("SELECT total_violation_points FROM students WHERE id = ?");
+diff --git a/api/endpoints_v3.php b/api/endpoints_v3.php
+index b04b152..a3abc5e 100644
+--- a/api/endpoints_v3.php
++++ b/api/endpoints_v3.php
+@@ -322,7 +322,8 @@ switch ($action) {
+     // UPDATE INCIDENT (v2 — mendukung logs, resolved_level, homeroom info)
+     // ============================================================
+     case 'update_incident_status':
+-        $user = requireAuth();
++        $user  = requireAuth();
++        $scope = requireKesiswaanScope($db, $user, 'incident');
+         $body = getRequestBody();
+         $id            = $body['id']            ?? '';
+         $newStatus     = $body['status']        ?? '';
+@@ -332,11 +333,12 @@ switch ($action) {
+         if (empty($id) || empty($newStatus)) errorResponse('ID dan status wajib diisi');
+ 
+         // Fetch existing logs
+-        $stmtGet = $db->prepare("SELECT logs, status FROM incidents WHERE id = ?");
++        $stmtGet = $db->prepare("SELECT logs, status, className FROM incidents WHERE id = ?");
+         $stmtGet->bind_param("s", $id);
+         $stmtGet->execute();
+         $existing = $stmtGet->get_result()->fetch_assoc();
+         if (!$existing) errorResponse('Insiden tidak ditemukan');
++        if (!classInScope($scope, $existing['className'])) errorResponse(KESISWAAN_MSG_KELAS, 403);
+ 
+         $logs = json_decode($existing['logs'] ?? '[]', true) ?: [];
+         $logs[] = [
+diff --git a/api/index.php b/api/index.php
+index 48bc0a8..724f08d 100644
+--- a/api/index.php
++++ b/api/index.php
+@@ -34,6 +34,7 @@ simantapLicenseGuard();
+ define('SIMANTAP_API', true);
+ 
+ require_once __DIR__ . '/db.php';
++require_once __DIR__ . '/kesiswaan_access.php';
+ 
+ $action = $_GET['action'] ?? '';
+ 
+@@ -761,7 +762,10 @@ switch ($action) {
+ 
+     // --- INCIDENTS ---
+     case 'get_incidents':
++        $user  = requireAuth();
++        $scope = requireKesiswaanScope($db, $user, 'incident');
+         $classId = $_GET['class'] ?? $_GET['classId'] ?? '';
++        if (!empty($classId) && !classInScope($scope, $classId)) errorResponse(KESISWAAN_MSG_KELAS, 403);
+         $rawSemester = $_GET['semester'] ?? '';
+         $semester = '';
+         if ($rawSemester === '1') $semester = 'GANJIL';
+@@ -788,6 +792,8 @@ switch ($action) {
+         $res = $db->query($sql);
+         $incidents = [];
+         while ($row = $res->fetch_assoc()) {
++            // Wali kelas: hanya insiden kelas perwaliannya
++            if (!classInScope($scope, $row['className'])) continue;
+             $row['points'] = (int)$row['points'];
+             $incidents[] = $row;
+         }
+@@ -795,16 +801,19 @@ switch ($action) {
+         break;
+ 
+     case 'save_incident':
+-        $user = requireAuth();
++        $user  = requireAuth();
++        $scope = requireKesiswaanScope($db, $user, 'incident');
+         $body = getRequestBody();
+ 
+         $id = $body['id'] ?? uniqid('inc_');
+-        
++
+         // Check if updating an existing incident
+         $checkExisting = $db->query("SELECT * FROM incidents WHERE id = '" . $db->real_escape_string($id) . "'");
+         $existing = $checkExisting->fetch_assoc();
+ 
+         if ($existing) {
++            if (!classInScope($scope, $existing['className'])) errorResponse(KESISWAAN_MSG_KELAS, 403);
++
+             // Partial Update
+             $status = $body['status'] ?? $existing['status'];
+             $notes = $body['notes'] ?? $body['actionTaken'] ?? $existing['actionTaken'];
+@@ -870,6 +879,13 @@ switch ($action) {
+             }
+         }
+ 
++        // Wali kelas: kelas insiden dan kelas siswa harus kelas perwaliannya
++        if ($scope['mode'] === 'CLASS') {
++            $classOk   = classInScope($scope, $classId) || classInScope($scope, $className);
++            $studentOk = empty($studentId) || studentInScope($db, $scope, $studentId);
++            if (!$classOk || !$studentOk) errorResponse(KESISWAAN_MSG_KELAS, 403);
++        }
++
+         // Auto-lookup points from violation_types if violation_code given
+         if (!empty($violationCode) && $points === 0) {
+             $vtRes = $db->prepare("SELECT points FROM violation_types WHERE violation_code = ?");
+@@ -928,6 +944,8 @@ switch ($action) {
+         break;
+ 
+     case 'delete_incident':
++        $user = requireAuth();
++        requireKesiswaanScope($db, $user, 'incident_delete');
+         $id = $_GET['id'] ?? '';
+         if (empty($id)) errorResponse('ID wajib disertakan');
+ 
+diff --git a/api/kesiswaan_access.php b/api/kesiswaan_access.php
+new file mode 100644
+index 0000000..2071eda
+--- /dev/null
++++ b/api/kesiswaan_access.php
+@@ -0,0 +1,151 @@
++<?php
++// kesiswaan_access.php - Otorisasi modul Kesiswaan (presensi kelas, insiden, panggilan ortu)
++// Spesifikasi: docs/specs/menu-kesiswaan-wali-kelas.md
++// Hanya boleh dimuat lewat api/index.php (yang sudah melewati gerbang lisensi)
++if (!defined('SIMANTAP_API')) { http_response_code(403); exit('Forbidden'); }
++
++const KESISWAAN_MSG_KELAS = 'Anda hanya dapat mengakses data kelas perwalian Anda.';
++
++/**
++ * Kunci kelas: lowercase tanpa spasi, "_", "-", dan "." (sama dengan L$ di frontend).
++ */
++function normalizeClassKey(?string $value): string
++{
++    return preg_replace('/[\s_.\-]/', '', strtolower(trim((string)$value)));
++}
++
++/**
++ * Ambil ulang data user dari DB agar perubahan role/wali kelas langsung berlaku.
++ */
++function loadFreshUser(mysqli $db, array $sessionUser): array
++{
++    $uid = $sessionUser['uid'] ?? '';
++    $stmt = $db->prepare("SELECT uid, displayName, role, class_homeroom, is_bk FROM users WHERE uid = ? LIMIT 1");
++    $stmt->bind_param("s", $uid);
++    $stmt->execute();
++    $row = $stmt->get_result()->fetch_assoc();
++    if (!$row) errorResponse('Unauthorized', 401);
++    return $row;
++}
++
++/**
++ * Tentukan cakupan akses Kesiswaan untuk user.
++ * $feature: attendance_read | attendance_write | incident | incident_delete | parent_call
++ * Hasil: ['mode' => 'ALL'|'CLASS'|'DENY', 'classKeys' => string[], 'classId' => ?string]
++ */
++function kesiswaanScope(mysqli $db, array $sessionUser, string $feature): array
++{
++    $fresh = loadFreshUser($db, $sessionUser);
++    $deny  = ['mode' => 'DENY', 'classKeys' => [], 'classId' => null];
++    $all   = ['mode' => 'ALL',  'classKeys' => [], 'classId' => null];
++
++    switch ($fresh['role']) {
++        case 'ADMIN':
++            return $all;
++
++        case 'KEPALA_SEKOLAH':
++            // Kepala Sekolah hanya baca untuk presensi
++            return $feature === 'attendance_write' ? $deny : $all;
++
++        case 'GURU':
++            if ((int)$fresh['is_bk'] === 1) {
++                $bkFeatures = ['incident', 'incident_delete', 'parent_call'];
++                return in_array($feature, $bkFeatures, true) ? $all : $deny;
++            }
++            $homeroom = trim((string)($fresh['class_homeroom'] ?? ''));
++            if ($homeroom === '' || $feature === 'incident_delete') return $deny;
++
++            $homeKey   = normalizeClassKey($homeroom);
++            $classKeys = [$homeKey];
++            $classId   = $homeroom;
++            try {
++                $res = $db->query("SELECT id, name FROM classes");
++                while ($res && ($c = $res->fetch_assoc())) {
++                    if (normalizeClassKey($c['id']) !== $homeKey) continue;
++                    $classId     = $c['id'];
++                    $classKeys[] = normalizeClassKey($c['id']);
++                    $classKeys[] = normalizeClassKey($c['name']);
++                }
++            } catch (Throwable $e) {
++                // Tabel classes belum ada: cukup pakai class_homeroom
++            }
++            $classKeys = array_values(array_unique(array_filter($classKeys, fn($k) => $k !== '')));
++            return ['mode' => 'CLASS', 'classKeys' => $classKeys, 'classId' => $classId];
++
++        default:
++            return $deny;
++    }
++}
++
++/**
++ * Seperti kesiswaanScope, tetapi langsung 403 bila tidak punya akses.
++ */
++function requireKesiswaanScope(mysqli $db, array $sessionUser, string $feature): array
++{
++    $scope = kesiswaanScope($db, $sessionUser, $feature);
++    if ($scope['mode'] === 'DENY') errorResponse('Anda tidak memiliki akses ke fitur Kesiswaan ini.', 403);
++    return $scope;
++}
++
++/**
++ * Apakah id/nama kelas termasuk cakupan.
++ */
++function classInScope(array $scope, ?string $classIdOrName): bool
++{
++    if ($scope['mode'] === 'ALL') return true;
++    if ($scope['mode'] !== 'CLASS') return false;
++    $key = normalizeClassKey($classIdOrName);
++    return $key !== '' && in_array($key, $scope['classKeys'], true);
++}
++
++/**
++ * Apakah siswa (berdasarkan kelas saat ini di tabel students) termasuk cakupan.
++ */
++function studentInScope(mysqli $db, array $scope, ?string $studentId): bool
++{
++    if ($scope['mode'] === 'ALL') return true;
++    if ($scope['mode'] !== 'CLASS' || empty($studentId)) return false;
++    $stmt = $db->prepare("SELECT class_id, class_name FROM students WHERE id = ? LIMIT 1");
++    $stmt->bind_param("s", $studentId);
++    $stmt->execute();
++    $row = $stmt->get_result()->fetch_assoc();
++    if (!$row) return false;
++    return classInScope($scope, $row['class_id']) || classInScope($scope, $row['class_name']);
++}
++
++/**
++ * Panggilan ortu termasuk cakupan bila kelas siswa saat ini atau class_name panggilan cocok.
++ */
++function parentCallInScope(array $scope, ?string $studentClassId, ?string $className): bool
++{
++    return classInScope($scope, $studentClassId) || classInScope($scope, $className);
++}
++
++/**
++ * Normalisasi status presensi: ALPHA (frontend) -> ALFA (DB). Status lain -> 400.
++ */
++function normalizeAttendanceStatus(?string $status): string
++{
++    $s = strtoupper(trim((string)($status ?? 'HADIR')));
++    if ($s === '') $s = 'HADIR';
++    if ($s === 'ALPHA') $s = 'ALFA';
++    if (!in_array($s, ['HADIR', 'SAKIT', 'IZIN', 'ALFA'], true)) {
++        errorResponse('Status presensi tidak valid: ' . $s, 400);
++    }
++    return $s;
++}
++
++/**
++ * Tahun ajaran & semester aktif dari system_config (fallback sama dengan save_journal).
++ */
++function activeAcademicPeriod(mysqli $db): array
++{
++    $config = ['active_academic_year' => '2025/2026', 'active_semester' => 'GANJIL'];
++    $stmt = $db->prepare("SELECT config_key, config_value FROM system_config WHERE config_key IN ('active_academic_year', 'active_semester')");
++    $stmt->execute();
++    $res = $stmt->get_result();
++    while ($row = $res->fetch_assoc()) {
++        if (trim((string)$row['config_value']) !== '') $config[$row['config_key']] = $row['config_value'];
++    }
++    return [$config['active_academic_year'], $config['active_semester']];
++}

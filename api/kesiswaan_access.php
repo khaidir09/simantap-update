@@ -15,6 +15,29 @@ function normalizeClassKey(?string $value): string
 }
 
 /**
+ * Cocokkan referensi kelas (id atau nama, format apa pun) ke baris classes.
+ * Hasil: ['id' => classes.id, 'name' => classes.name]; bila tidak ditemukan, id = name = input.
+ */
+function resolveClassRef(mysqli $db, ?string $classIdOrName): array
+{
+    $raw = trim((string)$classIdOrName);
+    $ref = ['id' => $raw, 'name' => $raw];
+    $key = normalizeClassKey($raw);
+    if ($key === '') return $ref;
+    try {
+        $res = $db->query("SELECT id, name FROM classes");
+        while ($res && ($c = $res->fetch_assoc())) {
+            if (normalizeClassKey($c['id']) === $key || normalizeClassKey($c['name']) === $key) {
+                return ['id' => $c['id'], 'name' => $c['name']];
+            }
+        }
+    } catch (Throwable $e) {
+        // Tabel classes belum ada: pakai input apa adanya
+    }
+    return $ref;
+}
+
+/**
  * Ambil ulang data user dari DB agar perubahan role/wali kelas langsung berlaku.
  */
 function loadFreshUser(mysqli $db, array $sessionUser): array

@@ -1,0 +1,706 @@
+diff --git a/api/endpoints_tu.php b/api/endpoints_tu.php
+index 2d85858..e285d7c 100644
+--- a/api/endpoints_tu.php
++++ b/api/endpoints_tu.php
+@@ -371,6 +371,8 @@ switch ($action) {
+             $db->query("DELETE FROM teacher_subjects WHERE teacher_id='" . $db->real_escape_string($id) . "'");
+             $db->query("DELETE FROM gtk_files WHERE gtk_id='" . $db->real_escape_string($id) . "'");
+             $db->query("DELETE FROM gtk_riwayat WHERE gtk_id='" . $db->real_escape_string($id) . "'");
++            // Kosongkan penugasan pembina ekskul milik akun ini
++            clearCoachAssignment($db, $id);
+             jsonResponse(['success' => true]);
+         }
+         else errorResponse('Gagal menghapus GTK');
+diff --git a/api/endpoints_v3.php b/api/endpoints_v3.php
+index ef28b92..05be4ac 100644
+--- a/api/endpoints_v3.php
++++ b/api/endpoints_v3.php
+@@ -177,8 +177,19 @@ switch ($action) {
+     // EXTRACURRICULAR MEMBERS
+     // ============================================================
+     case 'get_extracurricular_members':
++        // Spesifikasi: docs/specs/pembina-ekstrakurikuler.md
++        $user    = requireAuth();
++        $ctx     = ekskulContext($db, $user);
++        requireEkskulModule($ctx);
+         $ekId    = $_GET['extracurricular_id'] ?? '';
+         $classId = $_GET['class_id'] ?? '';
++        $level   = null;
++        if (empty($ekId)) {
++            if (!in_array($ctx['role'], ['ADMIN', 'KEPALA_SEKOLAH'], true)) errorResponse('ID ekskul wajib diisi');
++        } else {
++            [, $level] = requireEkskulLevel($db, $ctx, $ekId, ['ADMIN', 'MONITOR', 'COACH', 'HOMEROOM'], false);
++        }
++        $homeroomStudents = $level === 'HOMEROOM' ? ekskulHomeroomData($db, $ctx)['studentIds'] : null;
+ 
+         $sql = "SELECT em.*, s.nisn, s.parent_name, s.parent_phone
+                 FROM extracurricular_members em
+@@ -194,33 +205,48 @@ switch ($action) {
+         $stmt->execute();
+         $res = $stmt->get_result();
+         $members = [];
+-        while ($row = $res->fetch_assoc()) $members[] = $row;
++        while ($row = $res->fetch_assoc()) {
++            // Wali kelas hanya melihat anggota dari siswa perwaliannya
++            if ($homeroomStudents !== null && !isset($homeroomStudents[$row['student_id']])) continue;
++            $members[] = $row;
++        }
+         jsonResponse($members);
+         break;
+ 
+     case 'save_extracurricular_member':
++        requireMutationMethod();
+         $user = requireAuth();
+         $body = getRequestBody();
+         $ekId       = $body['extracurricular_id'] ?? '';
+         $studentId  = $body['student_id']   ?? '';
+-        $studentName= $body['student_name'] ?? '';
+-        $classId    = $body['class_id']     ?? '';
+-        $className  = $body['class_name']   ?? '';
+         $joinedAt   = $body['joined_at']    ?? date('Y-m-d');
+ 
+         if (empty($ekId) || empty($studentId)) errorResponse('ID ekskul dan ID siswa wajib diisi');
++        requireEkskulLevel($db, ekskulContext($db, $user), $ekId, ['ADMIN', 'COACH'], true);
++
++        // Nama & kelas diambil dari data siswa, bukan dari body
++        $stmtS = $db->prepare("SELECT name, class_id, class_name FROM students WHERE id = ? LIMIT 1");
++        $stmtS->bind_param("s", $studentId);
++        $stmtS->execute();
++        $student = $stmtS->get_result()->fetch_assoc();
++        if (!$student) errorResponse('Siswa tidak ditemukan');
++        $studentName = (string)$student['name'];
++        $classId     = (string)$student['class_id'];
++        $className   = (string)$student['class_name'];
+ 
+         $stmt = $db->prepare("INSERT INTO extracurricular_members (extracurricular_id, student_id, student_name, class_id, class_name, joined_at, status) VALUES (?,?,?,?,?,?,'AKTIF') ON DUPLICATE KEY UPDATE status='AKTIF', joined_at=VALUES(joined_at)");
+         $stmt->bind_param("ssssss", $ekId, $studentId, $studentName, $classId, $className, $joinedAt);
+-        if ($stmt->execute()) jsonResponse(['success' => true]);
+-        else errorResponse('Gagal menambah anggota: ' . $db->error);
++        $stmt->execute();
++        jsonResponse(['success' => true]);
+         break;
+ 
+     case 'delete_extracurricular_member':
++        requireMutationMethod();
+         $user = requireAuth();
+         $ekId      = $_GET['extracurricular_id'] ?? '';
+         $studentId = $_GET['student_id']         ?? '';
+         if (empty($ekId) || empty($studentId)) errorResponse('ID wajib diisi');
++        requireEkskulLevel($db, ekskulContext($db, $user), $ekId, ['ADMIN', 'COACH'], true);
+ 
+         $stmt = $db->prepare("DELETE FROM extracurricular_members WHERE extracurricular_id = ? AND student_id = ?");
+         $stmt->bind_param("ss", $ekId, $studentId);
+@@ -232,8 +258,13 @@ switch ($action) {
+     // EXTRACURRICULAR ACTIVITIES
+     // ============================================================
+     case 'get_extracurricular_activities':
++        $user = requireAuth();
++        $ctx  = ekskulContext($db, $user);
++        requireEkskulModule($ctx);
+         $ekId = $_GET['extracurricular_id'] ?? '';
+         if (empty($ekId)) { jsonResponse([]); break; }
++        [, $level] = requireEkskulLevel($db, $ctx, $ekId, ['ADMIN', 'MONITOR', 'COACH', 'HOMEROOM'], false);
++        $homeroomStudents = $level === 'HOMEROOM' ? ekskulHomeroomData($db, $ctx)['studentIds'] : null;
+ 
+         $stmt = $db->prepare("SELECT * FROM extracurricular_activities WHERE extracurricular_id = ? ORDER BY date DESC");
+         $stmt->bind_param("s", $ekId);
+@@ -242,15 +273,21 @@ switch ($action) {
+         $acts = [];
+         while ($row = $res->fetch_assoc()) {
+             $row['attendance'] = !empty($row['attendance']) ? json_decode($row['attendance'], true) : [];
++            if ($homeroomStudents !== null) {
++                // Wali kelas hanya melihat presensi siswa perwaliannya
++                $filtered = filterAttendanceToStudents($row['attendance'], $homeroomStudents);
++                $row['attendance'] = empty($filtered) ? new stdClass() : $filtered;
++            }
+             $acts[] = $row;
+         }
+         jsonResponse($acts);
+         break;
+ 
+     case 'save_extracurricular_activity':
++        requireMutationMethod();
+         $user = requireAuth();
+         $body = getRequestBody();
+-        $id         = $body['id']                  ?? uniqid('ea_');
++        $id         = trim((string)($body['id'] ?? '')) ?: uniqid('ea_');
+         $ekId       = $body['extracurricular_id']  ?? '';
+         $date       = $body['date']                ?? date('Y-m-d');
+         $title      = $body['title']               ?? '';
+@@ -258,6 +295,14 @@ switch ($action) {
+         $attendance = json_encode($body['attendance'] ?? []);
+ 
+         if (empty($ekId) || empty($title)) errorResponse('ID ekskul dan judul wajib diisi');
++        requireEkskulLevel($db, ekskulContext($db, $user), $ekId, ['ADMIN', 'COACH'], true);
++
++        // Aktivitas yang sudah ada tidak boleh dipindah/ditimpa dari ekskul lain
++        $stmtOld = $db->prepare("SELECT extracurricular_id FROM extracurricular_activities WHERE id = ? LIMIT 1");
++        $stmtOld->bind_param("s", $id);
++        $stmtOld->execute();
++        $old = $stmtOld->get_result()->fetch_assoc();
++        if ($old && $old['extracurricular_id'] !== $ekId) errorResponse(EKSKUL_MSG_KELOLA, 403);
+ 
+         $stmt = $db->prepare("REPLACE INTO extracurricular_activities (id, extracurricular_id, date, title, description, attendance, reporter_id, reporter_name) VALUES (?,?,?,?,?,?,?,?)");
+         $stmt->bind_param("ssssssss", $id, $ekId, $date, $title, $desc, $attendance, $user['uid'], $user['displayName']);
+@@ -266,9 +311,16 @@ switch ($action) {
+         break;
+ 
+     case 'delete_extracurricular_activity':
++        requireMutationMethod();
+         $user = requireAuth();
+         $id = $_GET['id'] ?? '';
+         if (empty($id)) errorResponse('ID wajib diisi');
++        $stmtOld = $db->prepare("SELECT extracurricular_id FROM extracurricular_activities WHERE id = ? LIMIT 1");
++        $stmtOld->bind_param("s", $id);
++        $stmtOld->execute();
++        $old = $stmtOld->get_result()->fetch_assoc();
++        if (!$old) errorResponse('Aktivitas tidak ditemukan', 404);
++        requireEkskulLevel($db, ekskulContext($db, $user), $old['extracurricular_id'], ['ADMIN', 'COACH'], true);
+ 
+         $stmt = $db->prepare("DELETE FROM extracurricular_activities WHERE id = ?");
+         $stmt->bind_param("s", $id);
+@@ -411,6 +463,8 @@ switch ($action) {
+                 $_SESSION['user']['is_bk'] = $isBk;
+                 $_SESSION['user']['role']  = $role;
+             }
++            // Pembina ekskul wajib akun GURU
++            if ($role !== 'GURU') clearCoachAssignment($db, $uid);
+ 
+             // =====================================================================
+             // SINKRONISASI USERS -> GTK (Dua Arah)
+diff --git a/api/index.php b/api/index.php
+index 55b35e4..3bfb0a3 100644
+--- a/api/index.php
++++ b/api/index.php
+@@ -35,6 +35,7 @@ define('SIMANTAP_API', true);
+ 
+ require_once __DIR__ . '/db.php';
+ require_once __DIR__ . '/kesiswaan_access.php';
++require_once __DIR__ . '/ekskul_access.php';
+ require_once __DIR__ . '/rekap_bulanan.php';
+ 
+ $action = $_GET['action'] ?? '';
+@@ -90,6 +91,8 @@ switch ($action) {
+ 
+             // Nama kelas perwalian untuk tampilan (class_homeroom tetap id kelas)
+             $user['class_homeroom_name'] = !empty($user['class_homeroom']) ? resolveClassRef($db, $user['class_homeroom'])['name'] : '';
++            // Penanda menu Ekstrakurikuler (pembina / wali kelas terkait)
++            $user = array_merge($user, ekskulMenuCounts($db, $user));
+ 
+             $_SESSION['user'] = $user;
+             jsonResponse(['user' => $user]);
+@@ -128,6 +131,8 @@ switch ($action) {
+             }
+             // Nama kelas perwalian untuk tampilan (class_homeroom tetap id kelas)
+             $user['class_homeroom_name'] = !empty($user['class_homeroom']) ? resolveClassRef($db, $user['class_homeroom'])['name'] : '';
++            // Dihitung ulang dari DB agar menu ekskul mengikuti penugasan terbaru saat halaman dimuat
++            $user = array_merge($user, ekskulMenuCounts($db, $user));
+         }
+         jsonResponse(['user' => $user]);
+         break;
+@@ -248,6 +253,8 @@ switch ($action) {
+                 $regDel->bind_param("s", $email);
+                 $regDel->execute();
+             }
++            // Pembina ekskul wajib akun GURU
++            if ($role !== 'GURU') clearCoachAssignment($db, $uid);
+             // Update session if modifying own account
+             if (isset($_SESSION['user']) && $_SESSION['user']['uid'] === $uid) {
+                 $_SESSION['user']['class_homeroom'] = $classHomeroom;
+@@ -295,6 +302,8 @@ switch ($action) {
+             // Clean up gtk_files & gtk_riwayat terkait
+             $db->query("DELETE FROM gtk_files WHERE gtk_id='" . $db->real_escape_string($uid) . "'");
+             $db->query("DELETE FROM gtk_riwayat WHERE gtk_id='" . $db->real_escape_string($uid) . "'");
++            // Kosongkan penugasan pembina ekskul milik akun ini
++            clearCoachAssignment($db, $uid);
+ 
+             jsonResponse(['success' => true]);
+         } else {
+@@ -1022,26 +1031,68 @@ switch ($action) {
+ 
+     // --- EXTRACURRICULARS ---
+     case 'get_extracurriculars':
+-        $res = $db->query("SELECT * FROM extracurriculars ORDER BY name ASC");
++        // Spesifikasi: docs/specs/pembina-ekstrakurikuler.md
++        $user = requireAuth();
++        $ctx = ekskulContext($db, $user);
++        requireEkskulModule($ctx);
++
++        $memberCounts = [];
++        $resCount = $db->query("SELECT extracurricular_id, COUNT(*) AS c FROM extracurricular_members WHERE status = 'AKTIF' GROUP BY extracurricular_id");
++        while ($resCount && ($c = $resCount->fetch_assoc())) $memberCounts[$c['extracurricular_id']] = (int)$c['c'];
++
++        $res = $db->query("SELECT e.*, u.displayName AS coach_display_name, u.role AS coach_role
++                           FROM extracurriculars e
++                           LEFT JOIN users u ON u.uid = e.coachId
++                           ORDER BY e.name ASC");
+         $extras = [];
+         while ($row = $res->fetch_assoc()) {
+-            $row['students'] = json_decode($row['students'], true) ?: [];
+-            $row['activities'] = json_decode($row['activities'], true) ?: [];
++            $level = ekskulAccessLevel($db, $ctx, $row);
++            if ($level === 'NONE') continue;
++
++            $coachValid = (string)$row['coachId'] !== '' && $row['coach_role'] === 'GURU';
++            $row['coachNameLegacy'] = $row['coachName'];
++            $row['coachName'] = $coachValid ? $row['coach_display_name'] : EKSKUL_LABEL_TANPA_PEMBINA;
++            $row['coachValid'] = $coachValid;
++            unset($row['coach_display_name'], $row['coach_role']);
++
++            $row['students'] = json_decode($row['students'] ?? '', true) ?: [];
++            $row['activities'] = json_decode($row['activities'] ?? '', true) ?: [];
++            $row['access'] = ekskulAccessFlags($level);
++            $row['memberCount'] = $level === 'HOMEROOM'
++                ? (ekskulHomeroomData($db, $ctx)['ekskulCounts'][$row['id']] ?? 0)
++                : ($memberCounts[$row['id']] ?? 0);
+             $extras[] = $row;
+         }
+         jsonResponse($extras);
+         break;
+ 
+     case 'get_ekskul_journals':
+-        $uid = $_GET['uid'] ?? '';
++        // Parameter uid diabaikan; data dibatasi ke ekskul yang boleh diakses user
++        $user = requireAuth();
++        $ctx = ekskulContext($db, $user);
++        requireEkskulModule($ctx);
++
++        $levels = [];
++        $resE = $db->query("SELECT id, coachId FROM extracurriculars");
++        while ($resE && ($e = $resE->fetch_assoc())) $levels[$e['id']] = ekskulAccessLevel($db, $ctx, $e);
++        $fallbackLevel = $ctx['role'] === 'ADMIN' ? 'ADMIN' : ($ctx['role'] === 'KEPALA_SEKOLAH' ? 'MONITOR' : 'NONE');
++
+         $sql = "SELECT ea.*, e.name as ekskulName FROM extracurricular_activities ea LEFT JOIN extracurriculars e ON ea.extracurricular_id = e.id ORDER BY ea.date DESC";
+         $stmt = $db->prepare($sql);
+         $stmt->execute();
+         $res = $stmt->get_result();
+         $journals = [];
+         while ($row = $res->fetch_assoc()) {
+-            $att = json_decode($row['attendance'], true);
++            $level = $levels[$row['extracurricular_id']] ?? $fallbackLevel;
++            if ($level === 'NONE') continue;
++
++            $att = json_decode($row['attendance'] ?? '', true);
+             $rate = 100;
++            if ($level === 'HOMEROOM') {
++                // Wali kelas: presensi dihitung dari siswa perwaliannya saja
++                $att = filterAttendanceToStudents($att, ekskulHomeroomData($db, $ctx)['studentIds']);
++                if (count($att) === 0) $rate = null;
++            }
+             if (is_array($att) && count($att) > 0) {
+                 $total = count($att);
+                 $present = 0;
+@@ -1062,22 +1113,29 @@ switch ($action) {
+                 'attendanceRate' => $rate,
+                 'isVerified' => true,
+                 'instructorId' => $row['reporter_id'],
+-                'instructorName' => $row['reporter_name']
++                'instructorName' => $row['reporter_name'],
++                'canManage' => ekskulAccessFlags($level)['canManageActivities']
+             ];
+         }
+         jsonResponse($journals);
+         break;
+ 
+     case 'save_ekskul_journal':
++        // Legacy (tidak dipanggil bundle): hanya Admin / pembina ekskul, pelapor dari session
++        requireMutationMethod();
++        $user = requireAuth();
++        $ctx = ekskulContext($db, $user);
+         $body = getRequestBody();
+         $id = uniqid('ea_');
+-        $ekId = $body['ekskulId'] ?? '';
++        $ekId = trim((string)($body['ekskulId'] ?? ''));
++        if ($ekId === '') errorResponse('ID ekskul wajib diisi');
++        requireEkskulLevel($db, $ctx, $ekId, ['ADMIN', 'COACH'], true);
+         $date = $body['date'] ?? date('Y-m-d');
+         $title = $body['topic'] ?? '';
+         $desc = $body['activities'] ?? '';
+-        $reporterId = $body['instructorId'] ?? '';
+-        $reporterName = $body['instructorName'] ?? '';
+-        
++        $reporterId = $user['uid'];
++        $reporterName = $user['displayName'];
++
+         $stmt = $db->prepare("REPLACE INTO extracurricular_activities (id, extracurricular_id, date, title, description, reporter_id, reporter_name) VALUES (?, ?, ?, ?, ?, ?, ?)");
+         $stmt->bind_param("sssssss", $id, $ekId, $date, $title, $desc, $reporterId, $reporterName);
+         if ($stmt->execute()) jsonResponse(['success' => true]);
+@@ -1089,31 +1147,56 @@ switch ($action) {
+         break;
+ 
+     case 'save_extracurricular':
++        // Buat baru: hanya Admin. Ubah: Admin semua field; pembina hanya jadwal, ruang, deskripsi.
++        requireMutationMethod();
++        $user = requireAuth();
++        $ctx = ekskulContext($db, $user);
++        requireEkskulModule($ctx);
+         $body = getRequestBody();
+-        
+-        $id = $body['id'] ?? uniqid('extra_');
+-        $name = $body['name'] ?? '';
+-        $coachId = $body['coachId'] ?? '';
+-        $coachName = $body['coachName'] ?? '';
+-        $schedule = $body['schedule'] ?? '';
+-        $description = $body['description'] ?? '';
+-        $room = $body['room'] ?? '';
+-        $students = json_encode($body['students'] ?? []);
+-        $activities = json_encode($body['activities'] ?? []);
+ 
+-        $stmt = $db->prepare("REPLACE INTO extracurriculars (id, name, coachId, coachName, schedule, description, room, students, activities) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+-        $stmt->bind_param("sssssssss", $id, $name, $coachId, $coachName, $schedule, $description, $room, $students, $activities);
+-        
+-        if ($stmt->execute()) {
+-            jsonResponse(['success' => true, 'id' => $id]);
++        $id = trim((string)($body['id'] ?? ''));
++        $existing = $id !== '' ? loadEkskulRow($db, $id) : null;
++        $level = $existing ? ekskulAccessLevel($db, $ctx, $existing) : ($ctx['role'] === 'ADMIN' ? 'ADMIN' : 'NONE');
++        if (!in_array($level, ['ADMIN', 'COACH'], true)) {
++            errorResponse($existing ? EKSKUL_MSG_KELOLA : 'Hanya Admin yang dapat menambah ekstrakurikuler.', 403);
++        }
++
++        // Field yang tidak dikirim mempertahankan nilai lama
++        $pick = fn(string $key) => array_key_exists($key, $body) ? (string)($body[$key] ?? '') : (string)($existing[$key] ?? '');
++        $schedule = trim($pick('schedule'));
++        $description = $pick('description');
++        $room = trim($pick('room'));
++
++        if ($level === 'ADMIN') {
++            $name = trim($pick('name'));
++            if ($name === '') errorResponse('Nama ekstrakurikuler wajib diisi');
++            [$coachId, $coachName] = resolveCoachAssignment($db, $pick('coachId'));
++        }
++
++        if (!$existing) {
++            if ($id === '') $id = uniqid('extra_');
++            $students = json_encode($body['students'] ?? []);
++            $activities = json_encode($body['activities'] ?? []);
++            $stmt = $db->prepare("INSERT INTO extracurriculars (id, name, coachId, coachName, schedule, description, room, students, activities) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
++            $stmt->bind_param("sssssssss", $id, $name, $coachId, $coachName, $schedule, $description, $room, $students, $activities);
++        } elseif ($level === 'ADMIN') {
++            $stmt = $db->prepare("UPDATE extracurriculars SET name = ?, coachId = ?, coachName = ?, schedule = ?, description = ?, room = ? WHERE id = ?");
++            $stmt->bind_param("sssssss", $name, $coachId, $coachName, $schedule, $description, $room, $id);
+         } else {
+-            errorResponse('Gagal menyimpan ekstrakurikuler');
++            // Pembina: nama dan pembina dari body diabaikan
++            $stmt = $db->prepare("UPDATE extracurriculars SET schedule = ?, description = ?, room = ? WHERE id = ?");
++            $stmt->bind_param("ssss", $schedule, $description, $room, $id);
+         }
++        $stmt->execute();
++        jsonResponse(['success' => true, 'id' => $id]);
+         break;
+ 
+     case 'delete_extracurricular':
++        requireMutationMethod();
++        $user = requireAuth();
+         $id = $_GET['id'] ?? '';
+         if (!$id) errorResponse('ID tidak valid');
++        requireEkskulLevel($db, ekskulContext($db, $user), $id, ['ADMIN'], true);
+         $db->begin_transaction();
+         try {
+             $stmt = $db->prepare("DELETE FROM extracurricular_members WHERE extracurricular_id = ?");
+diff --git a/api/kesiswaan_access.php b/api/kesiswaan_access.php
+index 53f2cab..5847738 100644
+--- a/api/kesiswaan_access.php
++++ b/api/kesiswaan_access.php
+@@ -77,29 +77,37 @@ function kesiswaanScope(mysqli $db, array $sessionUser, string $feature): array
+             }
+             $homeroom = trim((string)($fresh['class_homeroom'] ?? ''));
+             if ($homeroom === '' || $feature === 'incident_delete') return $deny;
+-
+-            $homeKey   = normalizeClassKey($homeroom);
+-            $classKeys = [$homeKey];
+-            $classId   = $homeroom;
+-            try {
+-                $res = $db->query("SELECT id, name FROM classes");
+-                while ($res && ($c = $res->fetch_assoc())) {
+-                    if (normalizeClassKey($c['id']) !== $homeKey) continue;
+-                    $classId     = $c['id'];
+-                    $classKeys[] = normalizeClassKey($c['id']);
+-                    $classKeys[] = normalizeClassKey($c['name']);
+-                }
+-            } catch (Throwable $e) {
+-                // Tabel classes belum ada: cukup pakai class_homeroom
+-            }
+-            $classKeys = array_values(array_unique(array_filter($classKeys, fn($k) => $k !== '')));
+-            return ['mode' => 'CLASS', 'classKeys' => $classKeys, 'classId' => $classId];
++            return homeroomClassScope($db, $homeroom);
+ 
+         default:
+             return $deny;
+     }
+ }
+ 
++/**
++ * Cakupan kelas perwalian dari nilai class_homeroom (id dan nama kelas yang cocok).
++ * Hasil: ['mode' => 'CLASS', 'classKeys' => string[], 'classId' => string]
++ */
++function homeroomClassScope(mysqli $db, string $homeroom): array
++{
++    $homeKey   = normalizeClassKey($homeroom);
++    $classKeys = [$homeKey];
++    $classId   = $homeroom;
++    try {
++        $res = $db->query("SELECT id, name FROM classes");
++        while ($res && ($c = $res->fetch_assoc())) {
++            if (normalizeClassKey($c['id']) !== $homeKey) continue;
++            $classId     = $c['id'];
++            $classKeys[] = normalizeClassKey($c['id']);
++            $classKeys[] = normalizeClassKey($c['name']);
++        }
++    } catch (Throwable $e) {
++        // Tabel classes belum ada: cukup pakai class_homeroom
++    }
++    $classKeys = array_values(array_unique(array_filter($classKeys, fn($k) => $k !== '')));
++    return ['mode' => 'CLASS', 'classKeys' => $classKeys, 'classId' => $classId];
++}
++
+ /**
+  * Seperti kesiswaanScope, tetapi langsung 403 bila tidak punya akses.
+  */
+diff --git a/api/ekskul_access.php b/api/ekskul_access.php
+new file mode 100644
+index 0000000..d90084a
+--- /dev/null
++++ b/api/ekskul_access.php
+@@ -0,0 +1,241 @@
++<?php
++// ekskul_access.php - Otorisasi modul Ekstrakurikuler (admin, kepala sekolah, guru pembina, wali kelas)
++// Spesifikasi: docs/specs/pembina-ekstrakurikuler.md
++// Hanya boleh dimuat lewat api/index.php (setelah kesiswaan_access.php)
++if (!defined('SIMANTAP_API')) { http_response_code(403); exit('Forbidden'); }
++
++require_once __DIR__ . '/kesiswaan_access.php';
++
++const EKSKUL_MSG_MODUL   = 'Anda tidak memiliki akses ke modul Ekstrakurikuler.';
++const EKSKUL_MSG_LIHAT   = 'Anda tidak memiliki akses ke data ekstrakurikuler ini.';
++const EKSKUL_MSG_KELOLA  = 'Anda tidak memiliki akses untuk mengelola ekstrakurikuler ini.';
++const EKSKUL_LABEL_TANPA_PEMBINA = 'Belum ada pembina';
++
++/**
++ * Konteks otorisasi: data user segar dari DB + cakupan kelas perwalian (khusus GURU wali).
++ */
++function ekskulContext(mysqli $db, array $sessionUser): array
++{
++    $fresh = loadFreshUser($db, $sessionUser);
++    return ekskulContextFromUser($db, $fresh);
++}
++
++function ekskulContextFromUser(mysqli $db, array $fresh): array
++{
++    $homeroom = trim((string)($fresh['class_homeroom'] ?? ''));
++    return [
++        'user'          => $fresh,
++        'role'          => $fresh['role'],
++        'homeroomScope' => ($fresh['role'] === 'GURU' && $homeroom !== '') ? homeroomClassScope($db, $homeroom) : null,
++    ];
++}
++
++/**
++ * Tolak role yang sama sekali tidak memakai modul ekskul (mis. TATA_USAHA).
++ */
++function requireEkskulModule(array $ctx): void
++{
++    if (!in_array($ctx['role'], ['ADMIN', 'KEPALA_SEKOLAH', 'GURU'], true)) {
++        errorResponse(EKSKUL_MSG_MODUL, 403);
++    }
++}
++
++/**
++ * Mutasi tidak boleh lewat GET (bundle memakai POST/DELETE).
++ */
++function requireMutationMethod(): void
++{
++    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET') {
++        errorResponse('Metode tidak diizinkan', 405);
++    }
++}
++
++/**
++ * Siswa perwalian dan ekskul terkait wali. Hasil di-cache per user selama request.
++ * Hasil: ['studentIds' => [id => true], 'ekskulCounts' => [ekskul_id => jumlah anggota AKTIF perwalian]]
++ */
++function ekskulHomeroomData(mysqli $db, array $ctx): array
++{
++    static $cache = [];
++    $empty = ['studentIds' => [], 'ekskulCounts' => []];
++    if ($ctx['homeroomScope'] === null) return $empty;
++
++    $uid = $ctx['user']['uid'];
++    if (isset($cache[$uid])) return $cache[$uid];
++
++    $scope = $ctx['homeroomScope'];
++    $studentIds = [];
++    $res = $db->query("SELECT id, class_id, class_name FROM students");
++    while ($res && ($s = $res->fetch_assoc())) {
++        if (classInScope($scope, $s['class_id']) || classInScope($scope, $s['class_name'])) {
++            $studentIds[$s['id']] = true;
++        }
++    }
++
++    // Anggota yang baris siswanya sudah tidak ada memakai kelas yang tercatat di keanggotaan
++    $ekskulCounts = [];
++    $res = $db->query("SELECT em.extracurricular_id, em.student_id, em.class_id, em.class_name, s.id AS sid
++                       FROM extracurricular_members em
++                       LEFT JOIN students s ON s.id = em.student_id
++                       WHERE em.status = 'AKTIF'");
++    while ($res && ($m = $res->fetch_assoc())) {
++        if ($m['sid'] !== null) {
++            $inScope = isset($studentIds[$m['student_id']]);
++        } else {
++            $inScope = classInScope($scope, $m['class_id']) || classInScope($scope, $m['class_name']);
++            if ($inScope) $studentIds[$m['student_id']] = true;
++        }
++        if ($inScope) {
++            $ekskulCounts[$m['extracurricular_id']] = ($ekskulCounts[$m['extracurricular_id']] ?? 0) + 1;
++        }
++    }
++
++    return $cache[$uid] = ['studentIds' => $studentIds, 'ekskulCounts' => $ekskulCounts];
++}
++
++/**
++ * Level akses user terhadap satu ekskul: ADMIN | MONITOR | COACH | HOMEROOM | NONE.
++ * $ekskulRow minimal berisi id dan coachId.
++ */
++function ekskulAccessLevel(mysqli $db, array $ctx, array $ekskulRow): string
++{
++    switch ($ctx['role']) {
++        case 'ADMIN':
++            return 'ADMIN';
++        case 'KEPALA_SEKOLAH':
++            return 'MONITOR';
++        case 'GURU':
++            $coachId = (string)($ekskulRow['coachId'] ?? '');
++            if ($coachId !== '' && $coachId === (string)$ctx['user']['uid']) return 'COACH';
++            $homeroom = ekskulHomeroomData($db, $ctx);
++            if (isset($homeroom['ekskulCounts'][$ekskulRow['id']])) return 'HOMEROOM';
++            return 'NONE';
++        default:
++            return 'NONE';
++    }
++}
++
++/**
++ * Flag izin untuk frontend.
++ */
++function ekskulAccessFlags(string $level): array
++{
++    $admin = $level === 'ADMIN';
++    $coach = $level === 'COACH';
++    return [
++        'level'               => $level,
++        'canEditInfo'         => $admin || $coach,
++        'canAssignCoach'      => $admin,
++        'canDelete'           => $admin,
++        'canManageMembers'    => $admin || $coach,
++        'canManageActivities' => $admin || $coach,
++    ];
++}
++
++function loadEkskulRow(mysqli $db, string $ekskulId): ?array
++{
++    if ($ekskulId === '') return null;
++    $stmt = $db->prepare("SELECT * FROM extracurriculars WHERE id = ? LIMIT 1");
++    $stmt->bind_param("s", $ekskulId);
++    $stmt->execute();
++    return $stmt->get_result()->fetch_assoc() ?: null;
++}
++
++/**
++ * Muat ekskul dan pastikan level user termasuk $allowedLevels.
++ * Mutasi: 404 bila ekskul tidak ada. Baca: 404 hanya untuk ADMIN/KS, selain itu 403.
++ * Hasil: [$ekskulRow, $level]
++ */
++function requireEkskulLevel(mysqli $db, array $ctx, string $ekskulId, array $allowedLevels, bool $isMutation): array
++{
++    requireEkskulModule($ctx);
++    $row = loadEkskulRow($db, $ekskulId);
++    if (!$row) {
++        if ($isMutation || in_array($ctx['role'], ['ADMIN', 'KEPALA_SEKOLAH'], true)) {
++            errorResponse('Ekstrakurikuler tidak ditemukan', 404);
++        }
++        errorResponse(EKSKUL_MSG_LIHAT, 403);
++    }
++    $level = ekskulAccessLevel($db, $ctx, $row);
++    if (!in_array($level, $allowedLevels, true)) {
++        errorResponse($isMutation ? EKSKUL_MSG_KELOLA : EKSKUL_MSG_LIHAT, 403);
++    }
++    return [$row, $level];
++}
++
++/**
++ * Validasi pembina: kosong = belum ada pembina; selain itu wajib akun role GURU.
++ * Hasil: [coachId, coachName]
++ */
++function resolveCoachAssignment(mysqli $db, $coachId): array
++{
++    $coachId = trim((string)$coachId);
++    if ($coachId === '') return ['', ''];
++    $stmt = $db->prepare("SELECT displayName, role FROM users WHERE uid = ? LIMIT 1");
++    $stmt->bind_param("s", $coachId);
++    $stmt->execute();
++    $row = $stmt->get_result()->fetch_assoc();
++    if (!$row || $row['role'] !== 'GURU') {
++        errorResponse('Pembina harus akun guru yang terdaftar.', 400);
++    }
++    return [$coachId, (string)$row['displayName']];
++}
++
++/**
++ * Batasi presensi ke siswa tertentu. Mendukung format map {student_id: ...} dan array [{student_id, ...}].
++ */
++function filterAttendanceToStudents($attendance, array $studentIds)
++{
++    if (!is_array($attendance) || empty($attendance)) return [];
++    if (array_is_list($attendance)) {
++        return array_values(array_filter($attendance, fn($item) =>
++            is_array($item) && isset($item['student_id']) && isset($studentIds[$item['student_id']])));
++    }
++    return array_filter($attendance, fn($studentId) => isset($studentIds[$studentId]), ARRAY_FILTER_USE_KEY);
++}
++
++/**
++ * Kosongkan penugasan pembina milik uid (akun dihapus atau role bukan GURU lagi).
++ */
++function clearCoachAssignment(mysqli $db, string $uid): void
++{
++    if ($uid === '') return;
++    try {
++        $stmt = $db->prepare("UPDATE extracurriculars SET coachId = '', coachName = '' WHERE coachId = ?");
++        $stmt->bind_param("s", $uid);
++        $stmt->execute();
++    } catch (Throwable $e) {
++        // Tabel ekskul bermasalah: jangan gagalkan operasi akun
++    }
++}
++
++/**
++ * Hitungan untuk menampilkan menu ekskul di sidebar (dipakai login & session).
++ * Tidak pernah memanggil errorResponse; kegagalan menghasilkan 0.
++ */
++function ekskulMenuCounts(mysqli $db, array $sessionUser): array
++{
++    $counts = ['ekskul_coach_count' => 0, 'ekskul_homeroom_count' => 0];
++    try {
++        $uid = (string)($sessionUser['uid'] ?? '');
++        $stmt = $db->prepare("SELECT uid, displayName, role, class_homeroom, is_bk FROM users WHERE uid = ? LIMIT 1");
++        $stmt->bind_param("s", $uid);
++        $stmt->execute();
++        $fresh = $stmt->get_result()->fetch_assoc();
++        if (!$fresh || $fresh['role'] !== 'GURU') return $counts;
++
++        $ctx = ekskulContextFromUser($db, $fresh);
++        $homeroom = ekskulHomeroomData($db, $ctx);
++        $res = $db->query("SELECT id, coachId FROM extracurriculars");
++        while ($res && ($e = $res->fetch_assoc())) {
++            if ((string)$e['coachId'] !== '' && $e['coachId'] === $fresh['uid']) {
++                $counts['ekskul_coach_count']++;
++            } elseif (isset($homeroom['ekskulCounts'][$e['id']])) {
++                $counts['ekskul_homeroom_count']++;
++            }
++        }
++    } catch (Throwable $e) {
++        return ['ekskul_coach_count' => 0, 'ekskul_homeroom_count' => 0];
++    }
++    return $counts;
++}

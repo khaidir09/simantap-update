@@ -35,6 +35,7 @@ define('SIMANTAP_API', true);
 
 require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/kesiswaan_access.php';
+require_once __DIR__ . '/ekskul_access.php';
 require_once __DIR__ . '/rekap_bulanan.php';
 
 $action = $_GET['action'] ?? '';
@@ -90,6 +91,8 @@ switch ($action) {
 
             // Nama kelas perwalian untuk tampilan (class_homeroom tetap id kelas)
             $user['class_homeroom_name'] = !empty($user['class_homeroom']) ? resolveClassRef($db, $user['class_homeroom'])['name'] : '';
+            // Penanda menu Ekstrakurikuler (pembina / wali kelas terkait)
+            $user = array_merge($user, ekskulMenuCounts($db, $user));
 
             $_SESSION['user'] = $user;
             jsonResponse(['user' => $user]);
@@ -128,6 +131,8 @@ switch ($action) {
             }
             // Nama kelas perwalian untuk tampilan (class_homeroom tetap id kelas)
             $user['class_homeroom_name'] = !empty($user['class_homeroom']) ? resolveClassRef($db, $user['class_homeroom'])['name'] : '';
+            // Dihitung ulang dari DB agar menu ekskul mengikuti penugasan terbaru saat halaman dimuat
+            $user = array_merge($user, ekskulMenuCounts($db, $user));
         }
         jsonResponse(['user' => $user]);
         break;
@@ -248,6 +253,8 @@ switch ($action) {
                 $regDel->bind_param("s", $email);
                 $regDel->execute();
             }
+            // Pembina ekskul wajib akun GURU
+            if ($role !== 'GURU') clearCoachAssignment($db, $uid);
             // Update session if modifying own account
             if (isset($_SESSION['user']) && $_SESSION['user']['uid'] === $uid) {
                 $_SESSION['user']['class_homeroom'] = $classHomeroom;
@@ -295,6 +302,8 @@ switch ($action) {
             // Clean up gtk_files & gtk_riwayat terkait
             $db->query("DELETE FROM gtk_files WHERE gtk_id='" . $db->real_escape_string($uid) . "'");
             $db->query("DELETE FROM gtk_riwayat WHERE gtk_id='" . $db->real_escape_string($uid) . "'");
+            // Kosongkan penugasan pembina ekskul milik akun ini
+            clearCoachAssignment($db, $uid);
 
             jsonResponse(['success' => true]);
         } else {
@@ -1022,26 +1031,68 @@ switch ($action) {
 
     // --- EXTRACURRICULARS ---
     case 'get_extracurriculars':
-        $res = $db->query("SELECT * FROM extracurriculars ORDER BY name ASC");
+        // Spesifikasi: docs/specs/pembina-ekstrakurikuler.md
+        $user = requireAuth();
+        $ctx = ekskulContext($db, $user);
+        requireEkskulModule($ctx);
+
+        $memberCounts = [];
+        $resCount = $db->query("SELECT extracurricular_id, COUNT(*) AS c FROM extracurricular_members WHERE status = 'AKTIF' GROUP BY extracurricular_id");
+        while ($resCount && ($c = $resCount->fetch_assoc())) $memberCounts[$c['extracurricular_id']] = (int)$c['c'];
+
+        $res = $db->query("SELECT e.*, u.displayName AS coach_display_name, u.role AS coach_role
+                           FROM extracurriculars e
+                           LEFT JOIN users u ON u.uid = e.coachId
+                           ORDER BY e.name ASC");
         $extras = [];
         while ($row = $res->fetch_assoc()) {
-            $row['students'] = json_decode($row['students'], true) ?: [];
-            $row['activities'] = json_decode($row['activities'], true) ?: [];
+            $level = ekskulAccessLevel($db, $ctx, $row);
+            if ($level === 'NONE') continue;
+
+            $coachValid = (string)$row['coachId'] !== '' && $row['coach_role'] === 'GURU';
+            $row['coachNameLegacy'] = $row['coachName'];
+            $row['coachName'] = $coachValid ? $row['coach_display_name'] : EKSKUL_LABEL_TANPA_PEMBINA;
+            $row['coachValid'] = $coachValid;
+            unset($row['coach_display_name'], $row['coach_role']);
+
+            $row['students'] = json_decode($row['students'] ?? '', true) ?: [];
+            $row['activities'] = json_decode($row['activities'] ?? '', true) ?: [];
+            $row['access'] = ekskulAccessFlags($level);
+            $row['memberCount'] = $level === 'HOMEROOM'
+                ? (ekskulHomeroomData($db, $ctx)['ekskulCounts'][$row['id']] ?? 0)
+                : ($memberCounts[$row['id']] ?? 0);
             $extras[] = $row;
         }
         jsonResponse($extras);
         break;
 
     case 'get_ekskul_journals':
-        $uid = $_GET['uid'] ?? '';
+        // Parameter uid diabaikan; data dibatasi ke ekskul yang boleh diakses user
+        $user = requireAuth();
+        $ctx = ekskulContext($db, $user);
+        requireEkskulModule($ctx);
+
+        $levels = [];
+        $resE = $db->query("SELECT id, coachId FROM extracurriculars");
+        while ($resE && ($e = $resE->fetch_assoc())) $levels[$e['id']] = ekskulAccessLevel($db, $ctx, $e);
+        $fallbackLevel = $ctx['role'] === 'ADMIN' ? 'ADMIN' : ($ctx['role'] === 'KEPALA_SEKOLAH' ? 'MONITOR' : 'NONE');
+
         $sql = "SELECT ea.*, e.name as ekskulName FROM extracurricular_activities ea LEFT JOIN extracurriculars e ON ea.extracurricular_id = e.id ORDER BY ea.date DESC";
         $stmt = $db->prepare($sql);
         $stmt->execute();
         $res = $stmt->get_result();
         $journals = [];
         while ($row = $res->fetch_assoc()) {
-            $att = json_decode($row['attendance'], true);
+            $level = $levels[$row['extracurricular_id']] ?? $fallbackLevel;
+            if ($level === 'NONE') continue;
+
+            $att = json_decode($row['attendance'] ?? '', true);
             $rate = 100;
+            if ($level === 'HOMEROOM') {
+                // Wali kelas: presensi dihitung dari siswa perwaliannya saja
+                $att = filterAttendanceToStudents($att, ekskulHomeroomData($db, $ctx)['studentIds']);
+                if (count($att) === 0) $rate = null;
+            }
             if (is_array($att) && count($att) > 0) {
                 $total = count($att);
                 $present = 0;
@@ -1062,22 +1113,29 @@ switch ($action) {
                 'attendanceRate' => $rate,
                 'isVerified' => true,
                 'instructorId' => $row['reporter_id'],
-                'instructorName' => $row['reporter_name']
+                'instructorName' => $row['reporter_name'],
+                'canManage' => ekskulAccessFlags($level)['canManageActivities']
             ];
         }
         jsonResponse($journals);
         break;
 
     case 'save_ekskul_journal':
+        // Legacy (tidak dipanggil bundle): hanya Admin / pembina ekskul, pelapor dari session
+        requireMutationMethod();
+        $user = requireAuth();
+        $ctx = ekskulContext($db, $user);
         $body = getRequestBody();
         $id = uniqid('ea_');
-        $ekId = $body['ekskulId'] ?? '';
+        $ekId = trim((string)($body['ekskulId'] ?? ''));
+        if ($ekId === '') errorResponse('ID ekskul wajib diisi');
+        requireEkskulLevel($db, $ctx, $ekId, ['ADMIN', 'COACH'], true);
         $date = $body['date'] ?? date('Y-m-d');
         $title = $body['topic'] ?? '';
         $desc = $body['activities'] ?? '';
-        $reporterId = $body['instructorId'] ?? '';
-        $reporterName = $body['instructorName'] ?? '';
-        
+        $reporterId = $user['uid'];
+        $reporterName = $user['displayName'];
+
         $stmt = $db->prepare("REPLACE INTO extracurricular_activities (id, extracurricular_id, date, title, description, reporter_id, reporter_name) VALUES (?, ?, ?, ?, ?, ?, ?)");
         $stmt->bind_param("sssssss", $id, $ekId, $date, $title, $desc, $reporterId, $reporterName);
         if ($stmt->execute()) jsonResponse(['success' => true]);
@@ -1089,31 +1147,56 @@ switch ($action) {
         break;
 
     case 'save_extracurricular':
+        // Buat baru: hanya Admin. Ubah: Admin semua field; pembina hanya jadwal, ruang, deskripsi.
+        requireMutationMethod();
+        $user = requireAuth();
+        $ctx = ekskulContext($db, $user);
+        requireEkskulModule($ctx);
         $body = getRequestBody();
-        
-        $id = $body['id'] ?? uniqid('extra_');
-        $name = $body['name'] ?? '';
-        $coachId = $body['coachId'] ?? '';
-        $coachName = $body['coachName'] ?? '';
-        $schedule = $body['schedule'] ?? '';
-        $description = $body['description'] ?? '';
-        $room = $body['room'] ?? '';
-        $students = json_encode($body['students'] ?? []);
-        $activities = json_encode($body['activities'] ?? []);
 
-        $stmt = $db->prepare("REPLACE INTO extracurriculars (id, name, coachId, coachName, schedule, description, room, students, activities) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-        $stmt->bind_param("sssssssss", $id, $name, $coachId, $coachName, $schedule, $description, $room, $students, $activities);
-        
-        if ($stmt->execute()) {
-            jsonResponse(['success' => true, 'id' => $id]);
-        } else {
-            errorResponse('Gagal menyimpan ekstrakurikuler');
+        $id = trim((string)($body['id'] ?? ''));
+        $existing = $id !== '' ? loadEkskulRow($db, $id) : null;
+        $level = $existing ? ekskulAccessLevel($db, $ctx, $existing) : ($ctx['role'] === 'ADMIN' ? 'ADMIN' : 'NONE');
+        if (!in_array($level, ['ADMIN', 'COACH'], true)) {
+            errorResponse($existing ? EKSKUL_MSG_KELOLA : 'Hanya Admin yang dapat menambah ekstrakurikuler.', 403);
         }
+
+        // Field yang tidak dikirim mempertahankan nilai lama
+        $pick = fn(string $key) => array_key_exists($key, $body) ? (string)($body[$key] ?? '') : (string)($existing[$key] ?? '');
+        $schedule = trim($pick('schedule'));
+        $description = $pick('description');
+        $room = trim($pick('room'));
+
+        if ($level === 'ADMIN') {
+            $name = trim($pick('name'));
+            if ($name === '') errorResponse('Nama ekstrakurikuler wajib diisi');
+            [$coachId, $coachName] = resolveCoachAssignment($db, $pick('coachId'));
+        }
+
+        if (!$existing) {
+            if ($id === '') $id = uniqid('extra_');
+            $students = json_encode($body['students'] ?? []);
+            $activities = json_encode($body['activities'] ?? []);
+            $stmt = $db->prepare("INSERT INTO extracurriculars (id, name, coachId, coachName, schedule, description, room, students, activities) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            $stmt->bind_param("sssssssss", $id, $name, $coachId, $coachName, $schedule, $description, $room, $students, $activities);
+        } elseif ($level === 'ADMIN') {
+            $stmt = $db->prepare("UPDATE extracurriculars SET name = ?, coachId = ?, coachName = ?, schedule = ?, description = ?, room = ? WHERE id = ?");
+            $stmt->bind_param("sssssss", $name, $coachId, $coachName, $schedule, $description, $room, $id);
+        } else {
+            // Pembina: nama dan pembina dari body diabaikan
+            $stmt = $db->prepare("UPDATE extracurriculars SET schedule = ?, description = ?, room = ? WHERE id = ?");
+            $stmt->bind_param("ssss", $schedule, $description, $room, $id);
+        }
+        $stmt->execute();
+        jsonResponse(['success' => true, 'id' => $id]);
         break;
 
     case 'delete_extracurricular':
+        requireMutationMethod();
+        $user = requireAuth();
         $id = $_GET['id'] ?? '';
         if (!$id) errorResponse('ID tidak valid');
+        requireEkskulLevel($db, ekskulContext($db, $user), $id, ['ADMIN'], true);
         $db->begin_transaction();
         try {
             $stmt = $db->prepare("DELETE FROM extracurricular_members WHERE extracurricular_id = ?");

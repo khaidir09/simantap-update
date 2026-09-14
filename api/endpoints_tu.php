@@ -371,6 +371,8 @@ switch ($action) {
             $db->query("DELETE FROM teacher_subjects WHERE teacher_id='" . $db->real_escape_string($id) . "'");
             $db->query("DELETE FROM gtk_files WHERE gtk_id='" . $db->real_escape_string($id) . "'");
             $db->query("DELETE FROM gtk_riwayat WHERE gtk_id='" . $db->real_escape_string($id) . "'");
+            // Kosongkan penugasan pembina ekskul milik akun ini
+            clearCoachAssignment($db, $id);
             jsonResponse(['success' => true]);
         }
         else errorResponse('Gagal menghapus GTK');

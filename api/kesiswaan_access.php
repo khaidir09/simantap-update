@@ -77,27 +77,35 @@ function kesiswaanScope(mysqli $db, array $sessionUser, string $feature): array
             }
             $homeroom = trim((string)($fresh['class_homeroom'] ?? ''));
             if ($homeroom === '' || $feature === 'incident_delete') return $deny;
-
-            $homeKey   = normalizeClassKey($homeroom);
-            $classKeys = [$homeKey];
-            $classId   = $homeroom;
-            try {
-                $res = $db->query("SELECT id, name FROM classes");
-                while ($res && ($c = $res->fetch_assoc())) {
-                    if (normalizeClassKey($c['id']) !== $homeKey) continue;
-                    $classId     = $c['id'];
-                    $classKeys[] = normalizeClassKey($c['id']);
-                    $classKeys[] = normalizeClassKey($c['name']);
-                }
-            } catch (Throwable $e) {
-                // Tabel classes belum ada: cukup pakai class_homeroom
-            }
-            $classKeys = array_values(array_unique(array_filter($classKeys, fn($k) => $k !== '')));
-            return ['mode' => 'CLASS', 'classKeys' => $classKeys, 'classId' => $classId];
+            return homeroomClassScope($db, $homeroom);
 
         default:
             return $deny;
     }
+}
+
+/**
+ * Cakupan kelas perwalian dari nilai class_homeroom (id dan nama kelas yang cocok).
+ * Hasil: ['mode' => 'CLASS', 'classKeys' => string[], 'classId' => string]
+ */
+function homeroomClassScope(mysqli $db, string $homeroom): array
+{
+    $homeKey   = normalizeClassKey($homeroom);
+    $classKeys = [$homeKey];
+    $classId   = $homeroom;
+    try {
+        $res = $db->query("SELECT id, name FROM classes");
+        while ($res && ($c = $res->fetch_assoc())) {
+            if (normalizeClassKey($c['id']) !== $homeKey) continue;
+            $classId     = $c['id'];
+            $classKeys[] = normalizeClassKey($c['id']);
+            $classKeys[] = normalizeClassKey($c['name']);
+        }
+    } catch (Throwable $e) {
+        // Tabel classes belum ada: cukup pakai class_homeroom
+    }
+    $classKeys = array_values(array_unique(array_filter($classKeys, fn($k) => $k !== '')));
+    return ['mode' => 'CLASS', 'classKeys' => $classKeys, 'classId' => $classId];
 }
 
 /**

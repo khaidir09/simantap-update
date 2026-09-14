@@ -5,6 +5,11 @@
 - Tanggal patch: 2026-09-13
 - Status upstream: **belum** ada perbaikan resmi. Dokumen ini sekaligus menjadi lampiran usulan ke BTIKP.
 
+> **Catatan (2026-09-14):** patch rekap bulanan (`docs/patches/rekap-bulanan-wali-kelas.md`) dibangun di atas patch ini.
+> - `app.html` kini mereferensikan `index-CGWL69P7-wali2.js`, bukan `-wali1.js`, sehingga hash `app.html` di tabel bawah tidak lagi berlaku.
+> - Rollback penuh harus membatalkan patch rekap bulanan lebih dulu.
+> - Setelah auto-update, terapkan ulang patch ini lebih dulu, lalu patch rekap bulanan.
+
 ## 1. Daftar file
 
 | File | Jenis | SHA-256 setelah patch |

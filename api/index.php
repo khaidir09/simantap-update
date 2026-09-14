@@ -35,6 +35,7 @@ define('SIMANTAP_API', true);
 
 require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/kesiswaan_access.php';
+require_once __DIR__ . '/rekap_bulanan.php';
 
 $action = $_GET['action'] ?? '';
 
@@ -2162,6 +2163,11 @@ switch ($action) {
         $stmt->execute();
 
         jsonResponse(['success' => true, 'url' => $webPath, 'filename' => $filename]);
+        break;
+
+    // --- REKAP BULANAN WALI KELAS (halaman HTML siap cetak, lihat api/rekap_bulanan.php) ---
+    case 'cetak_rekap_bulanan':
+        handleCetakRekapBulanan($db);
         break;
 
     default:

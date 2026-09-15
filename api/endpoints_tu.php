@@ -532,6 +532,12 @@ switch ($action) {
             errorResponse('Module dan file wajib diisi');
         }
 
+        // Perangkat Belajar: hanya GURU pemilik dokumen yang belum VERIFIED (docs/specs/perangkat-belajar-per-guru.md)
+        if ($module === 'lesson') {
+            $lessonUser = lessonUser($db, ['GURU']);
+            lessonAssertMutable($db, $lessonUser, (string)$recordId);
+        }
+
         $file = $_FILES['file'];
 
         // === VALIDASI & CLEANUP KHUSUS PAS FOTO ===

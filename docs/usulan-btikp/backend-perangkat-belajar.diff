@@ -1,0 +1,366 @@
+diff --git a/api/endpoints_tu.php b/api/endpoints_tu.php
+index e285d7c..2f77356 100644
+--- a/api/endpoints_tu.php
++++ b/api/endpoints_tu.php
+@@ -532,6 +532,12 @@ switch ($action) {
+             errorResponse('Module dan file wajib diisi');
+         }
+ 
++        // Perangkat Belajar: hanya GURU pemilik dokumen yang belum VERIFIED (docs/specs/perangkat-belajar-per-guru.md)
++        if ($module === 'lesson') {
++            $lessonUser = lessonUser($db, ['GURU']);
++            lessonAssertMutable($db, $lessonUser, (string)$recordId);
++        }
++
+         $file = $_FILES['file'];
+ 
+         // === VALIDASI & CLEANUP KHUSUS PAS FOTO ===
+diff --git a/api/index.php b/api/index.php
+index 3bfb0a3..9a313f2 100644
+--- a/api/index.php
++++ b/api/index.php
+@@ -36,6 +36,7 @@ define('SIMANTAP_API', true);
+ require_once __DIR__ . '/db.php';
+ require_once __DIR__ . '/kesiswaan_access.php';
+ require_once __DIR__ . '/ekskul_access.php';
++require_once __DIR__ . '/lesson_access.php';
+ require_once __DIR__ . '/rekap_bulanan.php';
+ 
+ $action = $_GET['action'] ?? '';
+@@ -1221,105 +1222,151 @@ switch ($action) {
+ 
+     // --- LESSON RPPS (LESSON KIT) ---
+     case 'get_lesson_rpps':
+-        $res = $db->query("
++        // GURU hanya melihat dokumen miliknya; KEPALA_SEKOLAH & ADMIN melihat semua
++        $user = lessonUser($db, ['GURU', 'KEPALA_SEKOLAH', 'ADMIN']);
++        $isGuru = $user['role'] === 'GURU';
++        $sql = "
+             SELECT r.*, r.status as db_status, r.verified_by, r.verified_by_name, r.verified_at, g.nip, g.nuptk, g.nik
+             FROM lesson_rpps r
+             LEFT JOIN gtk_pegawai g ON r.authorId = g.id COLLATE utf8mb4_unicode_ci
++            " . ($isGuru ? "WHERE r.authorId = ?" : "") . "
+             ORDER BY r.createdAt DESC
+-        ");
++        ";
++        $stmt = $db->prepare($sql);
++        if ($isGuru) $stmt->bind_param("s", $user['uid']);
++        $stmt->execute();
++        $res = $stmt->get_result();
+         $rpps = [];
+         while ($row = $res->fetch_assoc()) {
+             $fileUrl = $row['file_url'] ?? null;
+-            $nip = $row['nip'] ?? '';
+-            $nuptk = $row['nuptk'] ?? '';
+-            $nik = $row['nik'] ?? '';
++            $payloadData = !empty($row['payload']) ? (json_decode($row['payload'], true) ?: []) : [];
+ 
+             if (!empty($row['payload'])) {
+-                $payloadData = json_decode($row['payload'], true) ?: [];
+-                $merged = array_merge($row, $payloadData);
+-                // Ensure file_url and GTK identifiers from the DB column are always authoritative
+-                if ($fileUrl) $merged['fileUrl'] = $fileUrl;
+-                $merged['nip'] = $nip;
+-                $merged['nuptk'] = $nuptk;
+-                $merged['nik'] = $nik;
+-                // Merge status and verified details from DB
+-                $merged['status'] = $row['db_status'];
+-                $merged['verifiedBy'] = $row['verified_by'];
+-                $merged['verifiedByName'] = $row['verified_by_name'];
+-                $merged['verifiedAt'] = $row['verified_at'];
+-                $rpps[] = $merged;
++                $item = array_merge($row, $payloadData);
+             } else {
+-                $row['objectives'] = json_decode($row['objectives'], true) ?: [];
+-                $row['activities'] = json_decode($row['activities'], true) ?: [];
+-                $row['isCustom'] = (bool)$row['isCustom'];
+-                if ($fileUrl) $row['fileUrl'] = $fileUrl;
+-                $row['nip'] = $nip;
+-                $row['nuptk'] = $nuptk;
+-                $row['nik'] = $nik;
+-                $row['status'] = $row['db_status'];
+-                $row['verifiedBy'] = $row['verified_by'];
+-                $row['verifiedByName'] = $row['verified_by_name'];
+-                $row['verifiedAt'] = $row['verified_at'];
+-                $rpps[] = $row;
++                $item = $row;
++                $item['objectives'] = json_decode($row['objectives'], true) ?: [];
++                $item['activities'] = json_decode($row['activities'], true) ?: [];
++                $item['isCustom'] = (bool)$row['isCustom'];
+             }
++            unset($item['payload'], $item['db_status']);
++
++            // Kolom DB selalu otoritatif atas isi payload kiriman klien
++            $type = strtoupper(trim((string)($row['type'] ?? '')));
++            $locked = lessonIsLocked(['status' => $row['db_status']]);
++            $isOwner = $isGuru && lessonIsOwner($user, $row);
++            $item['id'] = $row['id'];
++            $item['type'] = $type !== '' ? $type : 'RPP';
++            $item['authorId'] = $row['authorId'];
++            $item['authorName'] = $row['authorName'];
++            $item['teacherId'] = $row['authorId'];
++            $item['teacherName'] = $row['authorName'];
++            if ($fileUrl) $item['fileUrl'] = $fileUrl;
++            $item['nip'] = $row['nip'] ?? '';
++            $item['nuptk'] = $row['nuptk'] ?? '';
++            $item['nik'] = $row['nik'] ?? '';
++            $item['status'] = $row['db_status'];
++            $item['verifiedBy'] = $row['verified_by'];
++            $item['verifiedByName'] = $row['verified_by_name'];
++            $item['verifiedAt'] = $row['verified_at'];
++            $item['isInteractive'] = !(($payloadData['isInteractive'] ?? null) === false || !empty($fileUrl));
++            $item['canEdit'] = $isOwner && !$locked;
++            $item['canDelete'] = ($isOwner && !$locked) || $user['role'] === 'ADMIN';
++            $rpps[] = $item;
+         }
+         jsonResponse($rpps);
+         break;
+ 
+     case 'save_lesson_rpp':
+-        $user = requireAuth();
++        // Hanya GURU yang membuat/mengubah dokumen miliknya; status tidak bisa diatur dari body
++        $user = lessonUser($db, ['GURU']);
++        lessonRequireMethod(['POST']);
+         $body = getRequestBody();
+ 
+-        $id = $body['id'] ?? uniqid('rpp_');
++        $id = trim((string)($body['id'] ?? ''));
++        $existing = $id !== '' ? lessonAssertMutable($db, $user, $id) : null;
++        if (!$existing) {
++            $id = uniqid('rpp_');
++            lessonEnsureIndex($db);
++        }
++
+         $title = $body['title'] ?? '';
+         $subject = $body['subject'] ?? $body['description'] ?? '';
+         $classLevel = $body['classSession'] ?? $body['classLevel'] ?? '';
+         $topic = $body['topic'] ?? $body['description'] ?? $title;
+-        // Determine type: explicit field takes priority, then detect by payload keys
+-        $type = $body['type'] ?? (isset($body['capaian']) || isset($body['rows']) ? 'SILABUS' : 'RPP');
+-        $fileUrl = $body['fileUrl'] ?? null;
+-
+-        $payloadJson = json_encode($body);
+-        $authorId = $user['uid'];
+-        $authorName = $user['displayName'];
++        // Tipe: field eksplisit diutamakan, lalu deteksi dari isi payload (silabus interaktif)
++        $type = strtoupper(trim((string)($body['type'] ?? (isset($body['capaian']) || isset($body['rows']) ? 'SILABUS' : 'RPP'))));
++        if (!in_array($type, LESSON_TYPES, true)) errorResponse('Tipe dokumen tidak valid');
++
++        $fileUrl = isset($body['fileUrl']) && $body['fileUrl'] !== '' ? (string)$body['fileUrl'] : null;
++        if ($fileUrl !== null && !lessonValidFileUrl($id, $fileUrl)) errorResponse('Lokasi berkas tidak valid');
++
++        $status = $existing ? ($existing['status'] ?: 'PENDING') : 'PENDING';
++        $authorId = $existing ? $existing['authorId'] : $user['uid'];
++        $authorName = $existing ? $existing['authorName'] : $user['displayName'];
++
++        // Identitas & status di payload mengikuti nilai server
++        $payload = $body;
++        unset($payload['verifiedBy'], $payload['verifiedByName'], $payload['verifiedAt'], $payload['canEdit'], $payload['canDelete']);
++        $payload['id'] = $id;
++        $payload['type'] = $type;
++        $payload['status'] = $status;
++        $payload['authorId'] = $authorId;
++        $payload['authorName'] = $authorName;
++        $payload['teacherId'] = $authorId;
++        $payload['teacherName'] = $authorName;
++        $payloadJson = json_encode($payload);
+         $isCustom = isset($body['isCustom']) ? (int)$body['isCustom'] : 1;
+-        $status = $body['status'] ?? 'PENDING';
+ 
+-        if ($fileUrl) {
+-            // When file_url is provided (second pass after upload), update that field
+-            $stmt = $db->prepare("INSERT INTO lesson_rpps (id, title, subject, classLevel, topic, objectives, activities, authorId, authorName, isCustom, type, payload, file_url, status) VALUES (?, ?, ?, ?, ?, '[]', '[]', ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE title=VALUES(title), subject=VALUES(subject), classLevel=VALUES(classLevel), topic=VALUES(topic), authorId=VALUES(authorId), authorName=VALUES(authorName), isCustom=VALUES(isCustom), type=VALUES(type), payload=VALUES(payload), file_url=VALUES(file_url), status=VALUES(status)");
+-            $stmt->bind_param("sssssssissss", $id, $title, $subject, $classLevel, $topic, $authorId, $authorName, $isCustom, $type, $payloadJson, $fileUrl, $status);
++        if ($existing) {
++            if ($fileUrl !== null) {
++                $stmt = $db->prepare("UPDATE lesson_rpps SET title=?, subject=?, classLevel=?, topic=?, isCustom=?, type=?, payload=?, file_url=? WHERE id=?");
++                $stmt->bind_param("ssssissss", $title, $subject, $classLevel, $topic, $isCustom, $type, $payloadJson, $fileUrl, $id);
++            } else {
++                $stmt = $db->prepare("UPDATE lesson_rpps SET title=?, subject=?, classLevel=?, topic=?, isCustom=?, type=?, payload=? WHERE id=?");
++                $stmt->bind_param("ssssisss", $title, $subject, $classLevel, $topic, $isCustom, $type, $payloadJson, $id);
++            }
+         } else {
+-            $stmt = $db->prepare("INSERT INTO lesson_rpps (id, title, subject, classLevel, topic, objectives, activities, authorId, authorName, isCustom, type, payload, status) VALUES (?, ?, ?, ?, ?, '[]', '[]', ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE title=VALUES(title), subject=VALUES(subject), classLevel=VALUES(classLevel), topic=VALUES(topic), authorId=VALUES(authorId), authorName=VALUES(authorName), isCustom=VALUES(isCustom), type=VALUES(type), payload=VALUES(payload), status=VALUES(status)");
+-            $stmt->bind_param("sssssssisss", $id, $title, $subject, $classLevel, $topic, $authorId, $authorName, $isCustom, $type, $payloadJson, $status);
++            $stmt = $db->prepare("INSERT INTO lesson_rpps (id, title, subject, classLevel, topic, objectives, activities, authorId, authorName, isCustom, type, payload, file_url, status) VALUES (?, ?, ?, ?, ?, '[]', '[]', ?, ?, ?, ?, ?, ?, ?)");
++            $stmt->bind_param("sssssssissss", $id, $title, $subject, $classLevel, $topic, $authorId, $authorName, $isCustom, $type, $payloadJson, $fileUrl, $status);
+         }
+ 
+-        if ($stmt->execute()) {
+-            jsonResponse(['success' => true, 'id' => $id, 'newId' => $id]);
+-        } else {
+-            errorResponse('Gagal menyimpan Perangkat Ajar: ' . $db->error);
++        try {
++            $stmt->execute();
++        } catch (Throwable $e) {
++            error_log('SIMANTAP save_lesson_rpp: ' . $e->getMessage());
++            errorResponse('Gagal menyimpan Perangkat Ajar', 500);
+         }
++        jsonResponse(['success' => true, 'id' => $id, 'newId' => $id]);
+         break;
+ 
+     case 'delete_lesson_rpp':
+-        $id = $_GET['id'] ?? '';
+-        if (empty($id)) errorResponse('ID wajib disertakan');
++        // GURU: miliknya & belum VERIFIED; ADMIN: dokumen apa pun
++        $user = lessonUser($db, ['GURU', 'ADMIN']);
++        lessonRequireMethod(['DELETE', 'POST']);
++        $id = trim((string)($_GET['id'] ?? ''));
++        if ($id === '') errorResponse('ID wajib disertakan');
++        lessonAssertMutable($db, $user, $id, true);
+ 
+         $stmt = $db->prepare("DELETE FROM lesson_rpps WHERE id = ?");
+         $stmt->bind_param("s", $id);
+-        if ($stmt->execute()) {
+-            jsonResponse(['success' => true]);
+-        } else {
+-            errorResponse('Gagal menghapus RPP');
++        try {
++            $stmt->execute();
++        } catch (Throwable $e) {
++            error_log('SIMANTAP delete_lesson_rpp: ' . $e->getMessage());
++            errorResponse('Gagal menghapus dokumen', 500);
+         }
++        lessonDeleteFiles($id);
++        jsonResponse(['success' => true]);
+         break;
+ 
+     case 'verify_lesson_rpp':
+-        $user = requireAuth();
+-        requireRole(['KEPALA_SEKOLAH', 'ADMIN']);
++        $user = lessonUser($db, ['KEPALA_SEKOLAH', 'ADMIN']);
++        lessonRequireMethod(['POST']);
+         $body = getRequestBody();
+         $id = $body['id'] ?? '';
+         if (empty($id)) errorResponse('ID RPP wajib disertakan');
++        if (!lessonLoad($db, (string)$id)) errorResponse(LESSON_MSG_NOT_FOUND, 404);
+ 
+         $verifiedBy = $user['uid'];
+         $verifiedByName = $user['displayName'];
+diff --git a/api/lesson_access.php b/api/lesson_access.php
+new file mode 100644
+index 0000000..81fb585
+--- /dev/null
++++ b/api/lesson_access.php
+@@ -0,0 +1,121 @@
++<?php
++// lesson_access.php - Otorisasi modul Perangkat Belajar (lesson_rpps) per guru pemilik
++// Spesifikasi: docs/specs/perangkat-belajar-per-guru.md
++// Hanya boleh dimuat lewat api/index.php (setelah kesiswaan_access.php dan ekskul_access.php)
++if (!defined('SIMANTAP_API')) { http_response_code(403); exit('Forbidden'); }
++
++require_once __DIR__ . '/kesiswaan_access.php';
++
++const LESSON_MSG_MODUL     = 'Anda tidak memiliki akses ke modul Perangkat Belajar.';
++const LESSON_MSG_NOT_FOUND = 'Dokumen tidak ditemukan';
++const LESSON_MSG_OWNER     = 'Anda bukan pemilik dokumen ini';
++const LESSON_MSG_LOCKED    = 'Dokumen sudah diverifikasi dan tidak dapat diubah';
++const LESSON_TYPES         = ['RPP', 'SILABUS', 'MODUL', 'ADMINISTRASI'];
++
++/**
++ * User segar dari DB + cek role modul. Role di luar $roles ditolak 403.
++ */
++function lessonUser(mysqli $db, array $roles): array
++{
++    $fresh = loadFreshUser($db, requireAuth());
++    if (!in_array($fresh['role'], $roles, true)) {
++        errorResponse(LESSON_MSG_MODUL, 403);
++    }
++    return $fresh;
++}
++
++/**
++ * Mutasi tidak boleh lewat GET (bundle memakai POST/DELETE).
++ */
++function lessonRequireMethod(array $allowed): void
++{
++    if (!in_array($_SERVER['REQUEST_METHOD'] ?? 'GET', $allowed, true)) {
++        errorResponse('Metode tidak diizinkan', 405);
++    }
++}
++
++function lessonLoad(mysqli $db, string $id): ?array
++{
++    if ($id === '') return null;
++    $stmt = $db->prepare("SELECT id, authorId, authorName, status, type, file_url FROM lesson_rpps WHERE id = ? LIMIT 1");
++    $stmt->bind_param("s", $id);
++    $stmt->execute();
++    return $stmt->get_result()->fetch_assoc() ?: null;
++}
++
++function lessonIsLocked(array $row): bool
++{
++    return strtoupper((string)($row['status'] ?? '')) === 'VERIFIED';
++}
++
++function lessonIsOwner(array $user, array $row): bool
++{
++    return ($row['authorId'] ?? '') !== '' && (string)$row['authorId'] === (string)$user['uid'];
++}
++
++/**
++ * Pastikan dokumen ada dan boleh diubah/dihapus oleh user.
++ * GURU: harus pemilik dan belum VERIFIED. ADMIN: hanya untuk hapus ($allowAdmin).
++ */
++function lessonAssertMutable(mysqli $db, array $user, string $id, bool $allowAdmin = false): array
++{
++    $row = lessonLoad($db, $id);
++    if (!$row) errorResponse(LESSON_MSG_NOT_FOUND, 404);
++    if ($allowAdmin && $user['role'] === 'ADMIN') return $row;
++    if ($user['role'] !== 'GURU' || !lessonIsOwner($user, $row)) errorResponse(LESSON_MSG_OWNER, 403);
++    if (lessonIsLocked($row)) errorResponse(LESSON_MSG_LOCKED, 409);
++    return $row;
++}
++
++function lessonSafeId(string $id): string
++{
++    return preg_replace('/[^a-zA-Z0-9_\-]/', '_', $id);
++}
++
++/**
++ * fileUrl hanya boleh menunjuk ke folder unggahan dokumen itu sendiri.
++ */
++function lessonValidFileUrl(string $id, string $fileUrl): bool
++{
++    $prefix = 'uploads/tu/lesson/' . lessonSafeId($id) . '/';
++    return strpos($fileUrl, $prefix) === 0
++        && strpos($fileUrl, '..') === false
++        && strpos($fileUrl, '\\') === false
++        && strlen($fileUrl) > strlen($prefix);
++}
++
++/**
++ * Hapus folder unggahan dokumen. Path dibangun dari id tersanitasi, bukan dari body/file_url.
++ */
++function lessonDeleteFiles(string $id): void
++{
++    $safeId = lessonSafeId($id);
++    if ($safeId === '' || trim($safeId, '_') === '') return;
++    $dir = __DIR__ . '/../uploads/tu/lesson/' . $safeId;
++    if (!is_dir($dir)) return;
++    foreach (scandir($dir) ?: [] as $name) {
++        if ($name === '.' || $name === '..') continue;
++        $path = $dir . '/' . $name;
++        if (is_file($path) && !@unlink($path)) {
++            error_log('SIMANTAP lesson: gagal menghapus file ' . $path);
++        }
++    }
++    if (!@rmdir($dir)) {
++        error_log('SIMANTAP lesson: gagal menghapus folder ' . $dir);
++    }
++}
++
++/**
++ * Index authorId agar filter per guru tetap cepat. Idempoten; kegagalan diabaikan.
++ */
++function lessonEnsureIndex(mysqli $db): void
++{
++    try {
++        $res = $db->query("SHOW INDEX FROM lesson_rpps WHERE Key_name = 'idx_lesson_author'");
++        if ($res && $res->num_rows === 0) {
++            $db->query("ALTER TABLE lesson_rpps ADD INDEX idx_lesson_author (authorId)");
++        }
++    } catch (Throwable $e) {
++        error_log('SIMANTAP lesson: gagal membuat index authorId - ' . $e->getMessage());
++    }
++}

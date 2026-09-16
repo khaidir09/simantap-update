@@ -1,0 +1,32 @@
+diff --git a/api/index.php b/api/index.php
+index c4fd558..fa8c1c4 100644
+--- a/api/index.php
++++ b/api/index.php
+@@ -399,12 +399,17 @@ switch ($action) {
+     case 'get_journals':
+         $user = requireAuth();
+         // GURU can only see their own journals; ADMIN/KEPALA_SEKOLAH see all
++        // NIP guru diambil dari users, cadangan dari gtk_pegawai (gtk_pegawai.id = users.uid)
++        $selJournal = "SELECT j.*, COALESCE(NULLIF(u.nip, ''), NULLIF(g.nip, ''), '') AS teacherNip"
++            . " FROM journal_entries j"
++            . " LEFT JOIN users u ON u.uid = j.teacherId"
++            . " LEFT JOIN gtk_pegawai g ON g.id = j.teacherId";
+         if ($user['role'] === 'GURU') {
+-            $stmt = $db->prepare("SELECT * FROM journal_entries WHERE teacherId = ? ORDER BY date DESC, createdAt DESC");
++            $stmt = $db->prepare($selJournal . " WHERE j.teacherId = ? ORDER BY j.date DESC, j.createdAt DESC");
+             $stmt->bind_param("s", $user['uid']);
+         } else {
+             // ADMIN / KEPALA_SEKOLAH see all
+-            $stmt = $db->prepare("SELECT * FROM journal_entries ORDER BY date DESC, createdAt DESC");
++            $stmt = $db->prepare($selJournal . " ORDER BY j.date DESC, j.createdAt DESC");
+         }
+         $stmt->execute();
+         $res = $stmt->get_result();
+@@ -432,6 +437,7 @@ switch ($action) {
+             $row['jamMulai']           = $row['jam_mulai']  ?? '';
+             $row['jamSelesai']         = $row['jam_selesai']?? '';
+             $row['time']               = $row['period']     ?? '';
++            $row['teacherNip']         = $row['teacherNip'] ?? '';
+             // Compute attendanceRate from stored value or recalculate from attendance data
+             $storedRate = isset($row['attendanceRate']) ? (int)$row['attendanceRate'] : 0;
+             if ($storedRate > 0) {

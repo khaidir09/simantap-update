@@ -37,6 +37,7 @@ require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/kesiswaan_access.php';
 require_once __DIR__ . '/ekskul_access.php';
 require_once __DIR__ . '/lesson_access.php';
+require_once __DIR__ . '/teacher_subject_access.php';
 require_once __DIR__ . '/rekap_bulanan.php';
 
 $action = $_GET['action'] ?? '';
@@ -1493,7 +1494,13 @@ switch ($action) {
 
     // --- TEACHER SUBJECTS (Guru ↔ Mata Pelajaran mapping) ---
     case 'get_teacher_subjects':
-        $teacherId = $_GET['teacher_id'] ?? '';
+        $tsActor   = tsUser($db, ['GURU', 'ADMIN', 'KEPALA_SEKOLAH', 'TATA_USAHA']);
+        $teacherId = trim($_GET['teacher_id'] ?? '');
+        if ($tsActor['role'] === 'GURU') {
+            // Guru hanya boleh membaca penugasan miliknya sendiri.
+            if ($teacherId === '') $teacherId = (string)$tsActor['uid'];
+            if ($teacherId !== (string)$tsActor['uid']) errorResponse(TS_MSG_OWNER_READ, 403);
+        }
         if (!empty($teacherId)) {
             $stmt = $db->prepare("SELECT ts.*, s.name as subject_name_full, s.category FROM teacher_subjects ts LEFT JOIN subjects s ON ts.subject_code COLLATE utf8mb4_unicode_ci = s.id COLLATE utf8mb4_unicode_ci WHERE ts.teacher_id = ? ORDER BY ts.subject_name ASC");
             $stmt->bind_param("s", $teacherId);
@@ -1511,7 +1518,8 @@ switch ($action) {
         break;
 
     case 'save_teacher_subjects':
-        requireRole(['ADMIN', 'KEPALA_SEKOLAH']);
+        tsUser($db, ['ADMIN']);
+        tsRequireMethod(['POST']);
         $body = getRequestBody();
         $teacherId   = trim($body['teacher_id'] ?? '');
         $subjectCode = trim($body['subject_code'] ?? '');
@@ -1531,18 +1539,24 @@ switch ($action) {
         break;
 
     case 'save_teacher_subjects_bulk':
-        $user = requireAuth();
+        $tsActor = tsUser($db, ['GURU', 'ADMIN']);
+        tsRequireMethod(['POST']);
         $body = getRequestBody();
         $teacherId = trim($body['teacher_id'] ?? '');
         $subjects  = $body['subjects'] ?? [];
 
         if (empty($teacherId)) errorResponse('teacher_id wajib diisi');
-        
-        if ($user['role'] === 'GURU' && $user['uid'] !== $teacherId) {
-            errorResponse('Anda hanya dapat mengubah penugasan mata pelajaran milik sendiri');
+        if (!is_array($subjects)) errorResponse('Format penugasan tidak valid');
+
+        if ($tsActor['role'] === 'GURU' && (string)$tsActor['uid'] !== $teacherId) {
+            errorResponse(TS_MSG_OWNER_WRITE, 403);
         }
 
-        // Delete existing assignments for this teacher first
+        // Validasi dijalankan sebelum transaksi. Item yang identik dengan baris
+        // tersimpan (data warisan) dilewati aturan baru agar guru tidak terkunci.
+        $tsStored = tsLoadRows($db, $teacherId);
+        $tsFinal  = tsValidateItems($db, $tsActor['role'], $subjects, $tsStored);
+
         $db->begin_transaction();
         try {
             $delStmt = $db->prepare("DELETE FROM teacher_subjects WHERE teacher_id = ?");
@@ -1550,64 +1564,43 @@ switch ($action) {
             $delStmt->bind_param("s", $teacherId);
             if (!$delStmt->execute()) throw new Exception("Execute delete failed: " . $delStmt->error);
 
-            // Re-insert all subjects
-            if (!empty($subjects)) {
+            if (!empty($tsFinal)) {
                 $insStmt = $db->prepare("INSERT INTO teacher_subjects (teacher_id, subject_code, subject_name, class_level, class_ids) VALUES (?, ?, ?, ?, ?)");
                 if (!$insStmt) {
                     throw new Exception("Prepare insert failed. Pastikan kolom class_ids sudah ada di tabel teacher_subjects. Error: " . $db->error);
                 }
-                
-                foreach ($subjects as $sub) {
-                    $subCode  = trim($sub['subject_code'] ?? $sub['code'] ?? '');
-                    $subName  = trim($sub['subject_name'] ?? $sub['name'] ?? '');
-                    $classLvl = trim($sub['class_level'] ?? '');
-                    $classIds = json_encode($sub['class_ids'] ?? []);
-                    if (empty($subCode)) continue;
-                    
+
+                foreach ($tsFinal as $sub) {
+                    $subCode  = $sub['subject_code'];
+                    $subName  = $sub['subject_name'];
+                    $classLvl = $sub['class_level'];
+                    $classIds = json_encode($sub['class_ids']);
+
                     $insStmt->bind_param("sssss", $teacherId, $subCode, $subName, $classLvl, $classIds);
                     if (!$insStmt->execute()) throw new Exception("Execute insert failed: " . $insStmt->error);
                 }
             }
+
+            // === SYNC: teacher_subjects -> gtk_pegawai (termasuk saat daftar kosong) ===
+            tsSyncGtk($db, $teacherId, $tsFinal);
+
             $db->commit();
-
-            // === TWO-WAY SYNC: teacher_subjects -> gtk_pegawai ===
-            // Aggregate all mapel names and class ids from newly saved subjects
-            $allMapelNames = [];
-            $allClassIds   = [];
-            foreach ($subjects as $sub) {
-                $sn = trim($sub['subject_name'] ?? $sub['name'] ?? '');
-                if (!empty($sn)) $allMapelNames[] = $sn;
-                $ids = $sub['class_ids'] ?? [];
-                if (is_array($ids)) {
-                    foreach ($ids as $cid) {
-                        $cid = str_replace('_', ' ', trim($cid));
-                        if (!empty($cid) && !in_array($cid, $allClassIds)) {
-                            $allClassIds[] = $cid;
-                        }
-                    }
-                }
-            }
-            $syncMapel = implode(', ', array_unique($allMapelNames));
-            $syncKelas = implode(', ', array_unique($allClassIds));
-
-            // Update gtk_pegawai where id = teacherId (after GTK/user decoupling, id == uid)
-            if (!empty($syncMapel) || !empty($syncKelas)) {
-                $upGTK = $db->prepare("UPDATE gtk_pegawai SET mapel=?, kelas_ajar=? WHERE id=?");
-                if ($upGTK) {
-                    $upGTK->bind_param("sss", $syncMapel, $syncKelas, $teacherId);
-                    $upGTK->execute();
-                }
-            }
-
-            jsonResponse(['success' => true, 'count' => count($subjects)]);
-        } catch (Exception $e) {
+        } catch (Throwable $e) {
             $db->rollback();
-            errorResponse('Gagal menyimpan penugasan mata pelajaran: ' . $e->getMessage());
+            error_log('save_teacher_subjects_bulk gagal: ' . $e->getMessage());
+            errorResponse('Gagal menyimpan penugasan mata pelajaran', 500);
         }
+
+        jsonResponse([
+            'success' => true,
+            'count'   => count($tsFinal),
+            'items'   => tsFetchForResponse($db, $teacherId),
+        ]);
         break;
 
     case 'delete_teacher_subject':
-        requireRole(['ADMIN', 'KEPALA_SEKOLAH']);
+        tsUser($db, ['ADMIN']);
+        tsRequireMethod(['POST', 'DELETE']);
         $id = $_GET['id'] ?? '';
         if (empty($id)) errorResponse('ID wajib disertakan');
         $stmt = $db->prepare("DELETE FROM teacher_subjects WHERE id = ?");

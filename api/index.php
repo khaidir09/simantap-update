@@ -1695,50 +1695,63 @@ switch ($action) {
 
     // --- STUDENT GRADES (Rekap nilai dari jurnal) ---
     case 'get_student_grades':
-        // Aggregates assessment_data from journal_entries for a class+subject+semester
+        // Rekap nilai kelas+mapel+semester. Daftar siswa diambil dari tabel students (siswa aktif),
+        // lalu digabung dengan assessment_data jurnal dan nilai ujian.
         $user = requireAuth();
+        $activePeriod = getActiveAcademicPeriod($db);
         $classId      = $_GET['class_id']      ?? '';
         $subjectId    = $_GET['subject_id']     ?? '';
-        $academicYear = $_GET['academic_year']  ?? '2025/2026';
-        $semester     = $_GET['semester']       ?? 'GANJIL';
+        $academicYear = $_GET['academic_year']  ?? $activePeriod['academic_year'];
+        $semester     = $_GET['semester']       ?? $activePeriod['semester'];
 
         if (empty($classId) || empty($subjectId)) errorResponse('class_id dan subject_id wajib diisi');
 
-        // Fetch all journals for this class+subject that have assessment_data
-        $stmt = $db->prepare("
+        requireGradeAccess($db, $user, $classId, $subjectId);
+
+        $classStudents = getActiveClassStudents($db, $classId);
+        $studentMap = []; // student_id => {name, tugas_scores:[], kuis_scores:[]}
+        foreach ($classStudents as $sid => $st) {
+            $studentMap[$sid] = [
+                'student_id'   => $sid,
+                'student_name' => $st['name'],
+                'tugas_scores' => [],
+                'kuis_scores'  => [],
+            ];
+        }
+
+        // Jurnal ber-penilaian untuk kelas+mapel ini, dibatasi rentang tanggal semester
+        $sqlJ = "
             SELECT id, date, topic, assessment_data, has_assessment
             FROM journal_entries
-            WHERE classId = ? AND subjectId = ? AND has_assessment = 1 AND isDraft = 0
-            ORDER BY date ASC
-        ");
-        $stmt->bind_param("ss", $classId, $subjectId);
+            WHERE classId = ? AND subjectId = ? AND has_assessment = 1 AND isDraft = 0";
+        $paramsJ = [$classId, $subjectId];
+        $range = getSemesterDateRange($academicYear, $semester);
+        if ($range) {
+            $sqlJ .= " AND date BETWEEN ? AND ?";
+            $paramsJ[] = $range[0];
+            $paramsJ[] = $range[1];
+        }
+        $sqlJ .= " ORDER BY date ASC";
+        $stmt = $db->prepare($sqlJ);
+        $stmt->bind_param(str_repeat('s', count($paramsJ)), ...$paramsJ);
         $stmt->execute();
         $res = $stmt->get_result();
 
         $journalAssessments = []; // [{journal_id, date, topic, students: [{id, name, tugas, kuis, notes}]}]
-        $studentMap = []; // student_id => {name, tugas_scores:[], kuis_scores:[]}
 
         while ($row = $res->fetch_assoc()) {
             $assessData = json_decode($row['assessment_data'], true) ?: [];
-            $journalEntry = [
+            $journalAssessments[] = [
                 'journal_id' => $row['id'],
                 'date'       => $row['date'],
                 'topic'      => $row['topic'],
                 'students'   => $assessData
             ];
-            $journalAssessments[] = $journalEntry;
 
             foreach ($assessData as $sa) {
                 $sid = $sa['student_id'] ?? '';
-                if (empty($sid)) continue;
-                if (!isset($studentMap[$sid])) {
-                    $studentMap[$sid] = [
-                        'student_id'   => $sid,
-                        'student_name' => $sa['student_name'] ?? 'Unknown',
-                        'tugas_scores' => [],
-                        'kuis_scores'  => [],
-                    ];
-                }
+                // Siswa yang sudah tidak aktif / pindah kelas tidak ikut direkap
+                if (empty($sid) || !isset($studentMap[$sid])) continue;
                 if (isset($sa['tugas_score']) && $sa['tugas_score'] !== null && $sa['tugas_score'] !== '') {
                     $studentMap[$sid]['tugas_scores'][] = (float)$sa['tugas_score'];
                 }
@@ -1761,7 +1774,7 @@ switch ($action) {
         while ($u = $ujianRes->fetch_assoc()) {
             $sid = $u['student_id'];
             if (!isset($ujianMap[$sid])) $ujianMap[$sid] = [];
-            $ujianMap[$sid][$u['ujian_type']] = (float)$u['score'];
+            $ujianMap[$sid][$u['ujian_type']] = $u['score'] !== null ? (float)$u['score'] : null;
         }
 
         // Get system config for weights
@@ -1769,21 +1782,6 @@ switch ($action) {
         $weights = ['bobot_tugas' => 30, 'bobot_kuis' => 30, 'bobot_ujian' => 40, 'kkm_default' => 75];
         while ($w = $resW->fetch_assoc()) {
             $weights[$w['config_key']] = (int)$w['config_value'];
-        }
-
-        // Build summary per student
-        $studentIds = array_keys($studentMap);
-        $studentPhotos = [];
-        if (!empty($studentIds)) {
-            $inClause = implode(',', array_fill(0, count($studentIds), '?'));
-            $stmtPhotos = $db->prepare("SELECT id, JSON_UNQUOTE(JSON_EXTRACT(docs_json, '$.pas_foto')) AS pas_foto FROM students WHERE id IN ($inClause)");
-            $types = str_repeat('s', count($studentIds));
-            $stmtPhotos->bind_param($types, ...$studentIds);
-            $stmtPhotos->execute();
-            $resPhotos = $stmtPhotos->get_result();
-            while ($p = $resPhotos->fetch_assoc()) {
-                $studentPhotos[$p['id']] = $p['pas_foto'];
-            }
         }
 
         $summaries = [];
@@ -1825,7 +1823,7 @@ switch ($action) {
             $summaries[] = [
                 'student_id'      => $sid,
                 'student_name'    => $sData['student_name'],
-                'pas_foto'        => $studentPhotos[$sid] ?? null,
+                'pas_foto'        => $classStudents[$sid]['pas_foto'] ?? null,
                 'avg_tugas'       => $avgTugas !== null ? round($avgTugas, 1) : null,
                 'avg_kuis'        => $avgKuis  !== null ? round($avgKuis,  1) : null,
                 'tugas_count'     => count($sData['tugas_scores']),
@@ -1849,7 +1847,7 @@ switch ($action) {
 
     // --- DAILY GRADES: Nilai dari satu pertemuan (satu tanggal) ---
     case 'get_daily_grades':
-        requireAuth();
+        $user = requireAuth();
         $classId   = $_GET['class_id']   ?? '';
         $subjectId = $_GET['subject_id'] ?? '';
         $dateParam = $_GET['date']        ?? '';
@@ -1857,6 +1855,8 @@ switch ($action) {
         if (empty($classId) || empty($subjectId) || empty($dateParam)) {
             errorResponse('class_id, subject_id, dan date wajib diisi');
         }
+
+        requireGradeAccess($db, $user, $classId, $subjectId);
 
         $stmt = $db->prepare("
             SELECT id, date, topic, assessment_data, studentAttendance
@@ -1884,33 +1884,27 @@ switch ($action) {
             if ($sid) $attendMap[$sid] = $a['status'] ?? 'HADIR';
         }
 
-        // Get pas_foto for students in this journal
-        $studentIds = array_filter(array_column($assessData, 'student_id'));
-        $photoMap = [];
-        if (!empty($studentIds)) {
-            $inClause = implode(',', array_fill(0, count($studentIds), '?'));
-            $stmtP = $db->prepare("SELECT id, JSON_UNQUOTE(JSON_EXTRACT(docs_json, '$.pas_foto')) AS pas_foto FROM students WHERE id IN ($inClause)");
-            $types = str_repeat('s', count($studentIds));
-            $stmtP->bind_param($types, ...$studentIds);
-            $stmtP->execute();
-            $resP = $stmtP->get_result();
-            while ($p = $resP->fetch_assoc()) {
-                $photoMap[$p['id']] = $p['pas_foto'];
-            }
+        // Daftar siswa dari tabel students (siswa aktif), nilai pertemuan digabung ke dalamnya
+        $classStudents = getActiveClassStudents($db, $classId);
+        $assessMap = [];
+        foreach ($assessData as $sa) {
+            $sid = $sa['student_id'] ?? '';
+            if ($sid !== '') $assessMap[$sid] = $sa;
         }
 
-        $students = array_map(function($sa) use ($attendMap, $photoMap) {
-            $sid = $sa['student_id'] ?? '';
-            return [
+        $students = [];
+        foreach ($classStudents as $sid => $st) {
+            $sa = $assessMap[$sid] ?? [];
+            $students[] = [
                 'student_id'        => $sid,
-                'student_name'      => $sa['student_name'] ?? 'Unknown',
-                'pas_foto'          => $photoMap[$sid] ?? null,
+                'student_name'      => $st['name'],
+                'pas_foto'          => $st['pas_foto'],
                 'tugas_score'       => isset($sa['tugas_score']) && $sa['tugas_score'] !== '' ? (float)$sa['tugas_score'] : null,
                 'kuis_score'        => isset($sa['kuis_score'])  && $sa['kuis_score']  !== '' ? (float)$sa['kuis_score']  : null,
                 'attendance_status' => $attendMap[$sid] ?? 'HADIR',
                 'notes'             => $sa['notes'] ?? '',
             ];
-        }, $assessData);
+        }
 
         jsonResponse([
             'journal_found' => true,
@@ -1922,7 +1916,7 @@ switch ($action) {
 
     // --- MONTHLY GRADES: Agregasi nilai per bulan ---
     case 'get_monthly_grades':
-        requireAuth();
+        $user = requireAuth();
         $classId    = $_GET['class_id']   ?? '';
         $subjectId  = $_GET['subject_id'] ?? '';
         $monthParam = $_GET['month']       ?? ''; // Format: YYYY-MM
@@ -1930,6 +1924,8 @@ switch ($action) {
         if (empty($classId) || empty($subjectId) || empty($monthParam)) {
             errorResponse('class_id, subject_id, dan month wajib diisi');
         }
+
+        requireGradeAccess($db, $user, $classId, $subjectId);
 
         $stmt = $db->prepare("
             SELECT id, date, topic, assessment_data
@@ -1943,43 +1939,31 @@ switch ($action) {
         $stmt->execute();
         $res = $stmt->get_result();
 
+        // Daftar siswa dari tabel students (siswa aktif), nilai jurnal digabung ke dalamnya
+        $classStudents = getActiveClassStudents($db, $classId);
         $studentMap = [];
+        foreach ($classStudents as $sid => $st) {
+            $studentMap[$sid] = [
+                'student_id'   => $sid,
+                'student_name' => $st['name'],
+                'tugas_scores' => [],
+                'kuis_scores'  => [],
+            ];
+        }
         $meetingCount = 0;
         while ($row = $res->fetch_assoc()) {
             $meetingCount++;
             $assessData = json_decode($row['assessment_data'], true) ?: [];
             foreach ($assessData as $sa) {
                 $sid = $sa['student_id'] ?? '';
-                if (empty($sid)) continue;
-                if (!isset($studentMap[$sid])) {
-                    $studentMap[$sid] = [
-                        'student_id'   => $sid,
-                        'student_name' => $sa['student_name'] ?? 'Unknown',
-                        'tugas_scores' => [],
-                        'kuis_scores'  => [],
-                    ];
-                }
+                // Siswa yang sudah tidak aktif / pindah kelas tidak ikut direkap
+                if (empty($sid) || !isset($studentMap[$sid])) continue;
                 if (isset($sa['tugas_score']) && $sa['tugas_score'] !== null && $sa['tugas_score'] !== '') {
                     $studentMap[$sid]['tugas_scores'][] = (float)$sa['tugas_score'];
                 }
                 if (isset($sa['kuis_score']) && $sa['kuis_score'] !== null && $sa['kuis_score'] !== '') {
                     $studentMap[$sid]['kuis_scores'][] = (float)$sa['kuis_score'];
                 }
-            }
-        }
-
-        // Get pas_foto
-        $studentIds = array_keys($studentMap);
-        $photoMap = [];
-        if (!empty($studentIds)) {
-            $inClause = implode(',', array_fill(0, count($studentIds), '?'));
-            $stmtP = $db->prepare("SELECT id, JSON_UNQUOTE(JSON_EXTRACT(docs_json, '$.pas_foto')) AS pas_foto FROM students WHERE id IN ($inClause)");
-            $types = str_repeat('s', count($studentIds));
-            $stmtP->bind_param($types, ...$studentIds);
-            $stmtP->execute();
-            $resP = $stmtP->get_result();
-            while ($p = $resP->fetch_assoc()) {
-                $photoMap[$p['id']] = $p['pas_foto'];
             }
         }
 
@@ -1994,7 +1978,7 @@ switch ($action) {
             $summaries[] = [
                 'student_id'   => $sid,
                 'student_name' => $sData['student_name'],
-                'pas_foto'     => $photoMap[$sid] ?? null,
+                'pas_foto'     => $classStudents[$sid]['pas_foto'] ?? null,
                 'avg_tugas'    => $avgTugas,
                 'avg_kuis'     => $avgKuis,
                 'tugas_count'  => count($sData['tugas_scores']),
@@ -2006,7 +1990,7 @@ switch ($action) {
             'summaries'      => $summaries,
             'month'          => $monthParam,
             'meeting_count'  => $meetingCount,
-            'has_data'       => !empty($summaries),
+            'has_data'       => $meetingCount > 0,
         ]);
         break;
 
@@ -2018,14 +2002,20 @@ switch ($action) {
         // Support bulk save: scores is array of {student_id, student_name, score}
         $classId      = $body['class_id']      ?? '';
         $subjectId    = $body['subject_id']     ?? '';
-        $academicYear = $body['academic_year']  ?? '2025/2026';
-        $semester     = $body['semester']       ?? 'GANJIL';
+        $activePeriod = getActiveAcademicPeriod($db);
+        $academicYear = $body['academic_year']  ?? $activePeriod['academic_year'];
+        $semester     = $body['semester']       ?? $activePeriod['semester'];
         $ujianType    = $body['ujian_type']     ?? 'UAS';
         $scores       = $body['scores']         ?? [];
 
         if (empty($classId) || empty($subjectId) || empty($scores)) {
             errorResponse('class_id, subject_id, dan scores wajib diisi');
         }
+
+        requireGradeAccess($db, $user, $classId, $subjectId);
+
+        // Hanya siswa aktif kelas ini yang boleh diberi nilai; nama diambil dari tabel students
+        $classStudents = getActiveClassStudents($db, $classId);
 
         $db->begin_transaction();
         try {
@@ -2034,18 +2024,20 @@ switch ($action) {
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON DUPLICATE KEY UPDATE score = VALUES(score), recorded_by = VALUES(recorded_by), recorder_name = VALUES(recorder_name)
             ");
+            $saved = 0;
             foreach ($scores as $s) {
-                $sid    = $s['student_id']   ?? '';
-                $sname  = $s['student_name'] ?? '';
+                $sid    = is_scalar($s['student_id'] ?? null) ? (string)$s['student_id'] : '';
+                if ($sid === '' || !isset($classStudents[$sid])) continue;
+                $sname  = $classStudents[$sid]['name'];
                 $score  = isset($s['score']) && $s['score'] !== '' ? (float)$s['score'] : null;
-                if (empty($sid)) continue;
                 $stmt->bind_param("sssssssdss",
                     $sid, $sname, $classId, $subjectId, $academicYear, $semester, $ujianType, $score, $user['uid'], $user['displayName']
                 );
                 $stmt->execute();
+                $saved++;
             }
             $db->commit();
-            jsonResponse(['success' => true, 'saved' => count($scores)]);
+            jsonResponse(['success' => true, 'saved' => $saved]);
         } catch (Exception $e) {
             $db->rollback();
             errorResponse('Gagal menyimpan nilai ujian: ' . $e->getMessage());
@@ -2056,10 +2048,13 @@ switch ($action) {
         $user = requireAuth();
         $classId      = $_GET['class_id']      ?? '';
         $subjectId    = $_GET['subject_id']     ?? '';
-        $academicYear = $_GET['academic_year']  ?? '2025/2026';
-        $semester     = $_GET['semester']       ?? 'GANJIL';
+        $activePeriod = getActiveAcademicPeriod($db);
+        $academicYear = $_GET['academic_year']  ?? $activePeriod['academic_year'];
+        $semester     = $_GET['semester']       ?? $activePeriod['semester'];
 
         if (empty($classId) || empty($subjectId)) errorResponse('class_id dan subject_id wajib diisi');
+
+        requireGradeAccess($db, $user, $classId, $subjectId);
 
         $stmt = $db->prepare("SELECT * FROM ujian_scores WHERE class_id = ? AND subject_id = ? AND academic_year = ? AND semester = ? ORDER BY student_name ASC");
         $stmt->bind_param("ssss", $classId, $subjectId, $academicYear, $semester);

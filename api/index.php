@@ -39,6 +39,7 @@ require_once __DIR__ . '/ekskul_access.php';
 require_once __DIR__ . '/lesson_access.php';
 require_once __DIR__ . '/teacher_subject_access.php';
 require_once __DIR__ . '/rekap_bulanan.php';
+require_once __DIR__ . '/persetujuan_jurnal.php';
 
 $action = $_GET['action'] ?? '';
 
@@ -459,15 +460,20 @@ switch ($action) {
         
         $id          = $body['id'] ?? uniqid('j_');
 
-        // Selain ADMIN/KEPALA_SEKOLAH hanya boleh mengubah jurnal miliknya sendiri.
-        // Dicek sebelum transaksi agar presensi/insiden tidak ikut tertulis saat ditolak.
-        if (!in_array($user['role'], ['ADMIN', 'KEPALA_SEKOLAH'])) {
-            $stmtOwner = $db->prepare("SELECT teacherId FROM journal_entries WHERE id = ?");
-            $stmtOwner->bind_param("s", $id);
-            $stmtOwner->execute();
-            $existing = $stmtOwner->get_result()->fetch_assoc();
-            if ($existing && $existing['teacherId'] !== $user['uid']) {
+        // Cek kepemilikan dan kunci verifikasi sebelum transaksi, agar presensi/insiden
+        // tidak ikut tertulis saat ditolak. Selain ADMIN/KEPALA_SEKOLAH hanya boleh mengubah
+        // jurnal miliknya sendiri yang belum diverifikasi.
+        $stmtOld = $db->prepare("SELECT teacherId, isVerified, verifiedBy, verifiedAt FROM journal_entries WHERE id = ?");
+        $stmtOld->bind_param("s", $id);
+        $stmtOld->execute();
+        $existing = $stmtOld->get_result()->fetch_assoc();
+        $isPimpinan = in_array($user['role'], ['ADMIN', 'KEPALA_SEKOLAH']);
+        if ($existing && !$isPimpinan) {
+            if ($existing['teacherId'] !== $user['uid']) {
                 errorResponse('Anda tidak berhak mengubah jurnal guru lain', 403);
+            }
+            if ((int)$existing['isVerified'] === 1) {
+                errorResponse('Jurnal sudah diverifikasi dan tidak dapat diubah', 403);
             }
         }
 
@@ -496,9 +502,12 @@ switch ($action) {
         $obstacles   = $body['kendala'] ?? $body['obstacles'] ?? null;
         $followUp    = $body['tindakLanjut'] ?? $body['followUp'] ?? null;
         $isDraft     = isset($body['isDraft']) ? (int)(bool)$body['isDraft'] : 1;
-        $isVerified  = isset($body['isVerified']) ? (int)(bool)$body['isVerified'] : 0;
-        $verifiedBy  = $body['verifiedBy'] ?? null;
-        $verifiedAt  = $body['verifiedAt'] ?? null;
+        // Status verifikasi tidak pernah diambil dari body: jurnal baru selalu belum
+        // terverifikasi, edit mempertahankan status lama.
+        $isVerified  = $existing ? (int)$existing['isVerified'] : 0;
+        $verifiedBy  = $existing ? $existing['verifiedBy'] : null;
+        $verifiedAt  = $existing ? $existing['verifiedAt'] : null;
+        if ($isVerified) $isDraft = 0;
         $assessment_data = $body['assessment_data'] ?? null;
         $has_assessment  = isset($body['has_assessment']) ? (int)$body['has_assessment'] : 0;
         $materials       = json_encode($body['materials'] ?? []);
@@ -661,14 +670,18 @@ switch ($action) {
         $id = $_GET['id'] ?? '';
         if (empty($id)) errorResponse('ID Jurnal wajib diisi');
 
-        // Selain ADMIN/KEPALA_SEKOLAH hanya boleh menghapus jurnal miliknya sendiri.
+        // Selain ADMIN/KEPALA_SEKOLAH hanya boleh menghapus jurnal miliknya sendiri
+        // yang belum diverifikasi.
         if (!in_array($user['role'], ['ADMIN', 'KEPALA_SEKOLAH'])) {
-            $stmtOwner = $db->prepare("SELECT teacherId FROM journal_entries WHERE id = ?");
+            $stmtOwner = $db->prepare("SELECT teacherId, isVerified FROM journal_entries WHERE id = ?");
             $stmtOwner->bind_param("s", $id);
             $stmtOwner->execute();
             $existing = $stmtOwner->get_result()->fetch_assoc();
             if ($existing && $existing['teacherId'] !== $user['uid']) {
                 errorResponse('Anda tidak berhak menghapus jurnal guru lain', 403);
+            }
+            if ($existing && (int)$existing['isVerified'] === 1) {
+                errorResponse('Jurnal sudah diverifikasi dan tidak dapat dihapus', 403);
             }
         }
 
@@ -2070,6 +2083,15 @@ switch ($action) {
         $journalId = $body['id'] ?? $_GET['id'] ?? '';
         if (empty($journalId)) errorResponse('Journal ID wajib diisi');
 
+        $stmt = $db->prepare("SELECT isDraft, isVerified FROM journal_entries WHERE id = ?");
+        $stmt->bind_param("s", $journalId);
+        $stmt->execute();
+        $jurnal = $stmt->get_result()->fetch_assoc();
+        if (!$jurnal) errorResponse('Jurnal tidak ditemukan', 404);
+        if ((int)$jurnal['isDraft'] === 1) errorResponse('Jurnal masih draf dan belum dapat diverifikasi');
+        // Sudah terverifikasi: jangan timpa verifiedBy/verifiedAt yang lama
+        if ((int)$jurnal['isVerified'] === 1) jsonResponse(['success' => true]);
+
         $verifiedAt = date('Y-m-d H:i:s');
         $stmt = $db->prepare("UPDATE journal_entries SET isVerified = 1, verifiedBy = ?, verifiedAt = ? WHERE id = ?");
         $stmt->bind_param("sss", $user['uid'], $verifiedAt, $journalId);
@@ -2078,6 +2100,18 @@ switch ($action) {
         } else {
             errorResponse('Gagal memverifikasi jurnal');
         }
+        break;
+
+    // --- PERSETUJUAN MASSAL JURNAL BULANAN (docs/specs/persetujuan-jurnal-bulanan.md) ---
+    case 'preview_journal_month_approval':
+        requireRole(['KEPALA_SEKOLAH', 'ADMIN']);
+        jsonResponse(persetujuanJurnalPreview($db, (string)($_GET['month'] ?? '')));
+        break;
+
+    case 'approve_journals_month':
+        $user = requireRole(['KEPALA_SEKOLAH', 'ADMIN']);
+        $body = getRequestBody();
+        jsonResponse(persetujuanJurnalSetujui($db, $user, (string)($body['month'] ?? ''), $body['ids'] ?? null));
         break;
 
     // --- PROFILE ---

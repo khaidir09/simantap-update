@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Disetujui untuk implementasi (belum dikerjakan) |
+| Status | Diimplementasikan (patch lokal): `docs/patches/persetujuan-jurnal-bulanan.md` |
 | Versi bundle acuan | SIMANTAP 1.0.2 (`api/version.php`) + patch detail jurnal/cetak (`assets/index-CGWL69P7-jurnal1.js`) |
 | Tanggal | 2026-09-24 |
 | Jalur rilis | Patch lokal pada bundle ini **dan** usulan perubahan ke upstream BTIKP |
@@ -74,7 +74,8 @@ satu bulan**, umumnya dilakukan di akhir bulan berjalan. Verifikasi satu per sat
    **"Setujui Jurnal Bulanan"** (hanya untuk `KEPALA_SEKOLAH`/`ADMIN`).
 2. Klik tombol untuk membuka modal **Persetujuan Jurnal Bulanan**:
    - pemilih bulan dan tahun, default mengikuti filter halaman (`N`/`E`), yaitu bulan berjalan;
-     bulan setelah bulan berjalan tidak bisa dipilih;
+     bulan setelah bulan berjalan tidak bisa dipilih; pilihan tahun mencakup tahun berjalan dan
+     4 tahun sebelumnya;
    - setiap perubahan bulan/tahun memanggil `preview_journal_month_approval`;
    - modal menampilkan:
      - **Akan disetujui: N jurnal** (angka utama);
@@ -224,7 +225,8 @@ mendapat pesan kepemilikan.
 
 ### 4.2 Tabel baru `journal_approval_batches`
 
-Dibuat dengan `CREATE TABLE IF NOT EXISTS` di awal kedua action baru (pola `get_classes`).
+Dibuat dengan `CREATE TABLE IF NOT EXISTS` di awal `approve_journals_month` (pola `get_classes`).
+Preview tidak menyentuh tabel ini, jadi tidak perlu menjalankan DDL.
 DDL yang sama dimasukkan ke usulan BTIKP sebagai migrasi resmi.
 
 ```sql
@@ -259,11 +261,12 @@ Tidak ada perubahan skema. Semantik kolom tetap: `isVerified`, `verifiedBy` (uid
 | `api/index.php` — `case 'delete_journal'` | S3 |
 | `api/index.php` — `case 'verify_journal'` | S4 |
 | `api/index.php` — action baru `preview_journal_month_approval`, `approve_journals_month` | §3.3, ditaruh setelah `verify_journal` |
+| `api/persetujuan_jurnal.php` | baru: logika preview/approve, validasi bulan, DDL log batch |
 | `api/db.php` | tidak diubah (pakai `requireRole`, `getRequestBody`, `jsonResponse`, `errorResponse`) |
 
-Helper bersama untuk menghitung `start`/`cutoff` dan memvalidasi `month` boleh didefinisikan
-sebagai fungsi lokal di `api/index.php` dengan `function_exists` guard, agar tidak bentrok saat
-endpoint file di-`require` ulang.
+Logika kedua action ada di file baru `api/persetujuan_jurnal.php` (pola `rekap_bulanan.php`),
+dimuat dengan `require_once` di `api/index.php`. File ini berisi validasi bulan dan rentang
+(`persetujuanJurnalRentang`), DDL log (`persetujuanJurnalPastikanTabel`), preview, dan approve.
 
 ### 5.2 Frontend (patch bundle lokal)
 
@@ -279,7 +282,11 @@ endpoint file di-`require` ulang.
     `et.journals.approveMonth(month, ids)`;
   - **P2** `XTe`: state modal, tombol "Setujui Jurnal Bulanan" di samping "Laporan Bulanan"
     (hanya `KEPALA_SEKOLAH`/`ADMIN`), komponen modal (§3.1), dan pembaruan state `r` setelah sukses;
-  - **P3** konversi `N` (singkatan bulan) + `E` (tahun) menjadi `YYYY-MM` untuk default modal.
+  - **P3** konversi `N` (singkatan bulan) + `E` (tahun) menjadi `YYYY-MM` untuk default modal;
+  - **P2d** header halaman Jurnal diberi `flex-wrap`: dengan tombol ketiga, tab bulan dan tombol
+    tidak muat satu baris, jadi grup tombol turun ke baris berikutnya;
+  - semua class Tailwind yang disisipkan harus sudah ada di CSS terkompilasi
+    (`assets/index-CC1PBzaO.css`); skrip patch memvalidasinya.
 - Penanganan error: tampilkan `error` dari body JSON; untuk HTTP 500 tanpa body, tampilkan
   "Terjadi kesalahan server".
 

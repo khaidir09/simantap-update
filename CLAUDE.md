@@ -8,7 +8,7 @@ SIMANTAP (Jurnal Mengajar Digital) is a school management app from BTIKP Disdikb
 
 This directory is a **production distribution bundle** issued to one school (see `SERTIFIKAT-LISENSI.txt`), not the development repo. It isn't a Git repository either.
 
-- **Frontend:** a prebuilt bundle (React 19, Tailwind 4) in `app.html` + `assets/index-*.js/css`. There's no frontend source here, so frontend changes can't be made in this directory. The bundle calls `api/index.php?action=<name>` and `api/update.php?action=<name>`.
+- **Frontend:** a prebuilt bundle (React 19, Tailwind 4) in `app.html` + `assets/index-*.js/css`. There's no frontend source here. Local frontend changes are string-replacement patch scripts in `docs/patches/apply-*-bundle.js`, each writing a new `assets/index-CGWL69P7-<name>.js` from the previous one and pointing `app.html` at it. The Tailwind CSS is precompiled, so a patch can only use classes that already exist in `assets/index-CC1PBzaO.css`. The bundle calls `api/index.php?action=<name>` and `api/update.php?action=<name>`.
 - **Backend:** plain PHP 8 + MySQLi with no framework and no Composer.
 - **Tooling:** there are no tests, linter, type checker, build step, or migration CLI here. Don't assume any framework commands exist. The only available check is `php -l <file>` (local PHP 8.2).
 - **Generated files:** files marked "DIGENERATE" (`api/version.php`, `api/license_pubkey.php`, `install/installer_config.php`, `install/schema.sql`) come from upstream scripts or patches that aren't in this directory. Don't edit them by hand.
@@ -81,7 +81,7 @@ Good references:
 
 The existing code has serious gaps. Don't use them as templates, and flag them when touching nearby code:
 - **Missing auth on mutations:** `register_guru` is a public signup. Several mutations have no auth at all: `delete_incident`, `delete_general_activity`, `delete_lesson_rpp`, `save_extracurricular`, `delete_extracurricular`, `save_ekskul_journal`, `save_student_registry`.
-- **Weak authorization:** most TU actions only call `requireAuth()`. Record ownership checks are mostly missing. Journals are the exception: `save_journal`/`delete_journal` limit roles other than `ADMIN`/`KEPALA_SEKOLAH` to their own journals. `save_journal`/`save_lesson_rpp` still accept `isVerified`/`status` from the body. `save_user`/`save_user_v2` let `TATA_USAHA` and `KEPALA_SEKOLAH` assign the `ADMIN` role.
+- **Weak authorization:** most TU actions only call `requireAuth()`. Record ownership checks are mostly missing. Journals are the exception: `save_journal`/`delete_journal` limit roles other than `ADMIN`/`KEPALA_SEKOLAH` to their own unverified journals, and `save_journal` keeps the verification status from the database. `save_lesson_rpp` still accepts `status` from the body. `save_user`/`save_user_v2` let `TATA_USAHA` and `KEPALA_SEKOLAH` assign the `ADMIN` role.
 - **Unauthenticated PII reads:** `gtk_list`, `student_list`, `get_teacher_registry`, `get_student_registry`, and `get_journal_stats` return personal data without login.
 - **Unsafe uploads:**
   - Uploads keep the client-supplied file extension.
@@ -110,7 +110,7 @@ Also check that ext `sodium` is enabled in the web server's php.ini if you're no
 
 `install/schema.sql` is the base schema. The installer imports it in chunks. Later schema changes come from:
 - signed patches applied by `api/update.php`, tracked in `schema_migrations`. Rollback doesn't revert migrations, and it picks the "latest" backup by string sort, so `1.0.9` sorts after `1.0.10`;
-- DDL inside request handlers. `student_list`/`student_create`/`student_update` convert `students.status` from the schema's enum (`AKTIF`, …) to VARCHAR (`Aktif`, `Pindah`, …). `get_classes` runs `CREATE TABLE IF NOT EXISTS` and seeds `classes` from `students`. Expect mixed-case status values; for example, v2's `get_students` filters on `status = 'AKTIF'`.
+- DDL inside request handlers. `student_list`/`student_create`/`student_update` convert `students.status` from the schema's enum (`AKTIF`, …) to VARCHAR (`Aktif`, `Pindah`, …). `get_classes` runs `CREATE TABLE IF NOT EXISTS` and seeds `classes` from `students`. `approve_journals_month` creates `journal_approval_batches`. Expect mixed-case status values; for example, v2's `get_students` filters on `status = 'AKTIF'`.
 
 Known data bugs and hardcoded values:
 - `tu_file_delete` with `module=siswa` queries a nonexistent `siswa` table.

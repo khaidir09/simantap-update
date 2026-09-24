@@ -1,0 +1,75 @@
+diff --git a/api/endpoints_v3.php b/api/endpoints_v3.php
+index 05be4ac..fc94fb9 100644
+--- a/api/endpoints_v3.php
++++ b/api/endpoints_v3.php
+@@ -710,6 +710,70 @@ switch ($action) {
+         else errorResponse('Gagal memperbarui: ' . $db->error);
+         break;
+ 
++    // ============================================================
++    // GET_DASHBOARD_ANALYTICS — Ringkasan nyata untuk kartu "Pusat Analisis"
++    // di dashboard ADMIN / Kepala Sekolah. Semua angka dihitung dari database,
++    // tidak ada nilai contoh yang ditanam di frontend.
++    // ============================================================
++    case 'get_dashboard_analytics':
++        requireRole(['ADMIN', 'KEPALA_SEKOLAH']);
++
++        // Pakai tanggal PHP (APP_TIMEZONE), sama seperti get_homeroom_dashboard,
++        // supaya tidak ikut zona waktu server MySQL.
++        $today    = date('Y-m-d');
++        $weekFrom = date('Y-m-d', strtotime('-6 days'));
++        $namaHari = ['Minggu','Senin','Selasa','Rabu','Kamis','Jumat','Sabtu'];
++
++        // Guru aktif = akun ber-role GURU (tabel users tidak punya kolom status).
++        $stmt = $db->prepare("SELECT COUNT(*) AS c FROM users WHERE role = 'GURU'");
++        $stmt->execute();
++        $totalGuru = (int)$stmt->get_result()->fetch_assoc()['c'];
++
++        // Jurnal hari ini: jumlah entri dan jumlah guru yang mengisi.
++        // DISTINCT teacherId dibatasi ke akun GURU agar sinkron dengan $totalGuru.
++        $stmt = $db->prepare("SELECT COUNT(*) AS entri,
++                COUNT(DISTINCT CASE WHEN u.role = 'GURU' THEN j.teacherId END) AS guru
++            FROM journal_entries j
++            LEFT JOIN users u ON u.uid = j.teacherId
++            WHERE j.date = ?");
++        $stmt->bind_param("s", $today);
++        $stmt->execute();
++        $rowToday    = $stmt->get_result()->fetch_assoc();
++        $jurnalHari  = (int)$rowToday['entri'];
++        $guruMengisi = (int)$rowToday['guru'];
++
++        // Jurnal 7 hari terakhir (termasuk hari ini) untuk konteks tren.
++        $stmt = $db->prepare("SELECT COUNT(*) AS c FROM journal_entries WHERE date BETWEEN ? AND ?");
++        $stmt->bind_param("ss", $weekFrom, $today);
++        $stmt->execute();
++        $jurnalMinggu = (int)$stmt->get_result()->fetch_assoc()['c'];
++
++        // Jurnal yang belum diverifikasi kepala sekolah.
++        $stmt = $db->prepare("SELECT COUNT(*) AS c FROM journal_entries WHERE isVerified = 0");
++        $stmt->execute();
++        $belumVerifikasi = (int)$stmt->get_result()->fetch_assoc()['c'];
++
++        // Tanggal jurnal terakhir, berguna saat hari ini masih kosong.
++        $stmt = $db->prepare("SELECT MAX(date) AS d FROM journal_entries");
++        $stmt->execute();
++        $jurnalTerakhir = $stmt->get_result()->fetch_assoc()['d'];
++
++        $guruBelum = max(0, $totalGuru - $guruMengisi);
++        $persen    = $totalGuru > 0 ? (int)round($guruMengisi / $totalGuru * 100) : 0;
++
++        jsonResponse([
++            'tanggal'                 => $today,
++            'hari'                    => $namaHari[(int)date('w')],
++            'total_guru'              => $totalGuru,
++            'guru_mengisi'            => $guruMengisi,
++            'guru_belum'              => $guruBelum,
++            'persen'                  => $persen,
++            'jurnal_hari_ini'         => $jurnalHari,
++            'jurnal_7_hari'           => $jurnalMinggu,
++            'jurnal_belum_verifikasi' => $belumVerifikasi,
++            'jurnal_terakhir'         => $jurnalTerakhir ?: null,
++        ]);
++        break;
+     default:
+         return false;
+ }

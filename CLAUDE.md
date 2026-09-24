@@ -81,7 +81,7 @@ Good references:
 
 The existing code has serious gaps. Don't use them as templates, and flag them when touching nearby code:
 - **Missing auth on mutations:** `register_guru` is a public signup. Several mutations have no auth at all: `delete_incident`, `delete_general_activity`, `delete_lesson_rpp`, `save_extracurricular`, `delete_extracurricular`, `save_ekskul_journal`, `save_student_registry`.
-- **Weak authorization:** most TU actions only call `requireAuth()`. There are no record ownership checks: any user can delete any journal, and `save_journal`/`save_lesson_rpp` accept `isVerified`/`status` from the body. `save_user`/`save_user_v2` let `TATA_USAHA` and `KEPALA_SEKOLAH` assign the `ADMIN` role.
+- **Weak authorization:** most TU actions only call `requireAuth()`. Record ownership checks are mostly missing. Journals are the exception: `save_journal`/`delete_journal` limit roles other than `ADMIN`/`KEPALA_SEKOLAH` to their own journals. `save_journal`/`save_lesson_rpp` still accept `isVerified`/`status` from the body. `save_user`/`save_user_v2` let `TATA_USAHA` and `KEPALA_SEKOLAH` assign the `ADMIN` role.
 - **Unauthenticated PII reads:** `gtk_list`, `student_list`, `get_teacher_registry`, `get_student_registry`, and `get_journal_stats` return personal data without login.
 - **Unsafe uploads:**
   - Uploads keep the client-supplied file extension.

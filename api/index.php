@@ -458,6 +458,19 @@ switch ($action) {
         $body = getRequestBody();
         
         $id          = $body['id'] ?? uniqid('j_');
+
+        // Selain ADMIN/KEPALA_SEKOLAH hanya boleh mengubah jurnal miliknya sendiri.
+        // Dicek sebelum transaksi agar presensi/insiden tidak ikut tertulis saat ditolak.
+        if (!in_array($user['role'], ['ADMIN', 'KEPALA_SEKOLAH'])) {
+            $stmtOwner = $db->prepare("SELECT teacherId FROM journal_entries WHERE id = ?");
+            $stmtOwner->bind_param("s", $id);
+            $stmtOwner->execute();
+            $existing = $stmtOwner->get_result()->fetch_assoc();
+            if ($existing && $existing['teacherId'] !== $user['uid']) {
+                errorResponse('Anda tidak berhak mengubah jurnal guru lain', 403);
+            }
+        }
+
         $teacherId   = $user['uid'];
         $teacherName = $user['displayName'];
         $date        = $body['date'] ?? date('Y-m-d');
@@ -647,6 +660,17 @@ switch ($action) {
         $user = requireAuth();
         $id = $_GET['id'] ?? '';
         if (empty($id)) errorResponse('ID Jurnal wajib diisi');
+
+        // Selain ADMIN/KEPALA_SEKOLAH hanya boleh menghapus jurnal miliknya sendiri.
+        if (!in_array($user['role'], ['ADMIN', 'KEPALA_SEKOLAH'])) {
+            $stmtOwner = $db->prepare("SELECT teacherId FROM journal_entries WHERE id = ?");
+            $stmtOwner->bind_param("s", $id);
+            $stmtOwner->execute();
+            $existing = $stmtOwner->get_result()->fetch_assoc();
+            if ($existing && $existing['teacherId'] !== $user['uid']) {
+                errorResponse('Anda tidak berhak menghapus jurnal guru lain', 403);
+            }
+        }
 
         $stmt = $db->prepare("DELETE FROM journal_entries WHERE id = ?");
         $stmt->bind_param("s", $id);

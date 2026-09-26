@@ -5,6 +5,13 @@
 //  T4 Modal detail, gaya item siswa tidak hadir: hapus truncate, beri jarak nama-keterangan.
 //  T5 Cetak/PDF: beri jarak antara bagian III (kehadiran) dan IV (penilaian). Mesin cetak (bk)
 //     memaksa grid menjadi display:block sehingga gap-6 hilang dan bagian IV menempel.
+//  T6 Helper __smtJamJurnal: "Jam ke-.. (mulai - selesai)" dari jam pelajaran. Kolom period
+//     (field time) adalah jam input jurnal, bukan jam pertemuan, jadi tidak dipakai lagi.
+//  T7 Tabel jurnal: waktu memakai jam pelajaran.
+//  T8 Kartu jurnal: waktu memakai jam pelajaran.
+//  T9 Modal detail + cetakan: kotak Waktu tidak lagi jatuh ke jam input.
+//  T10 Modal detail: badge "Pukul" hanya dari jam mulai-selesai (detik dipangkas).
+//  T11 Modal detail, "Hasil Penilaian Langsung": nama siswa tanpa NISN.
 // Prasyarat: patch Dispensasi Siswa (apply-dispensasi-bundle.js) sudah diterapkan.
 // Pemakaian (dari root deploy): node docs/patches/apply-tampilan-jurnal-bundle.js
 // File sumber TIDAK diubah; hasil ditulis ke salinan baru dan app.html diarahkan ke salinan itu.
@@ -14,7 +21,9 @@ const crypto = require('crypto');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const SRC_NAME = 'index-CGWL69P7-dispensasi1.js';
-const OUT_NAME = 'index-CGWL69P7-tampiljurnal1.js';
+const OUT_NAME = 'index-CGWL69P7-tampiljurnal2.js';
+// Hasil versi sebelumnya dari skrip ini; app.html yang masih menunjuk ke sini ikut dialihkan.
+const OLD_OUT_NAMES = ['index-CGWL69P7-tampiljurnal1.js'];
 const SRC_SHA256 = '3aaf8c2081d2646b692fe03abad126b67a969be48bc6f672e0e417dca5d3cd71';
 const CSS_NAME = 'index-CC1PBzaO.css';
 
@@ -66,6 +75,37 @@ const patches = [
     from: '.smt-jurnal-sec1 .smt-isi ul,.smt-jurnal-sec1 .smt-isi ol{margin:0 0 6px;padding-left:18px}"',
     to: '.smt-jurnal-sec1 .smt-isi ul,.smt-jurnal-sec1 .smt-isi ol{margin:0 0 6px;padding-left:18px}.smt-jurnal-sec34>*+*{margin-top:24px}"',
   },
+  {
+    id: 'T6 helper jam pelajaran',
+    from: 'function JTe({month:e,year:t,journals:n,onClose:r,kopConfig:s,printKop:i}){',
+    to: 'function __smtJamJurnal(e){const j=String(e.jam||"").trim(),m=e.jamMulai&&e.jamSelesai?`${String(e.jamMulai).slice(0,5)} - ${String(e.jamSelesai).slice(0,5)}`:"";return j&&m?`Jam ke-${j} (${m})`:j?`Jam ke-${j}`:m}'
+      + 'function JTe({month:e,year:t,journals:n,onClose:r,kopConfig:s,printKop:i}){',
+  },
+  {
+    id: 'T7 tabel jurnal waktu jam pelajaran',
+    from: 'className:"text-[10px] font-bold text-slate-400 uppercase tracking-tighter",children:Q.time||"Waktu tidak diatur"}',
+    to: 'className:"text-[10px] font-bold text-slate-400 uppercase tracking-tighter",children:__smtJamJurnal(Q)||"Waktu tidak diatur"}',
+  },
+  {
+    id: 'T8 kartu jurnal waktu jam pelajaran',
+    from: '{weekday:"short",day:"numeric",month:"short"})," • ",Q.time||"Waktu tidak diatur"]',
+    to: '{weekday:"short",day:"numeric",month:"short"})," • ",__smtJamJurnal(Q)||"Waktu tidak diatur"]',
+  },
+  {
+    id: 'T9 kotak Waktu tanpa jam input',
+    from: 'return j&&m?`Jam ke-${j} (${m})`:j?`Jam ke-${j}`:m||e.time||"-"})();',
+    to: 'return j&&m?`Jam ke-${j} (${m})`:j?`Jam ke-${j}`:m||"-"})();',
+  },
+  {
+    id: 'T10 badge Pukul dari jam mulai-selesai',
+    from: 'e.jamMulai&&e.jamSelesai||e.time?a.jsxs("span",{className:"w-fit text-[10px] bg-blue-50 text-blue-600 px-3 py-1 rounded-full border border-blue-100 font-extrabold uppercase tracking-wider",children:["Pukul: ",e.jamMulai&&e.jamSelesai?`${e.jamMulai} - ${e.jamSelesai}`:e.time]}):null',
+    to: 'e.jamMulai&&e.jamSelesai?a.jsxs("span",{className:"w-fit text-[10px] bg-blue-50 text-blue-600 px-3 py-1 rounded-full border border-blue-100 font-extrabold uppercase tracking-wider",children:["Pukul: ",`${String(e.jamMulai).slice(0,5)} - ${String(e.jamSelesai).slice(0,5)}`]}):null',
+  },
+  {
+    id: 'T11 penilaian langsung tanpa NISN',
+    from: 'children:(()=>{const M=A.find(H=>H.id===I.student_id);return`${M!=null&&M.nisn?`${M.nisn} - `:""}${I.student_name}`})()}',
+    to: 'children:I.student_name||(()=>{const M=A.find(H=>H.id===I.student_id);return M?M.name:`Siswa (${I.student_id})`})()}',
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -77,7 +117,9 @@ const hilang = KELAS_PATCH.filter((c) => {
 });
 if (hilang.length) fail('class Tailwind tidak ada di ' + CSS_NAME + ': ' + hilang.join(' '));
 
-if (src.includes('smt-jurnal-sec34')) fail(`smt-jurnal-sec34 sudah ada di ${SRC_NAME}.`);
+for (const nama of ['smt-jurnal-sec34', '__smtJamJurnal']) {
+  if (src.includes(nama)) fail(`${nama} sudah ada di ${SRC_NAME}.`);
+}
 
 let out = src;
 for (const p of patches) {
@@ -94,8 +136,8 @@ const html = fs.readFileSync(appHtmlPath, 'utf8');
 if (html.includes(`./assets/${OUT_NAME}`)) {
   console.log('app.html sudah mereferensikan bundle patch.');
 } else {
-  const ref = `./assets/${SRC_NAME}`;
-  if (html.split(ref).length - 1 !== 1) fail(`app.html tidak mereferensikan ${ref} tepat 1 kali.`);
+  const ref = [SRC_NAME, ...OLD_OUT_NAMES].map((n) => `./assets/${n}`).find((r) => html.includes(r));
+  if (!ref || html.split(ref).length - 1 !== 1) fail(`app.html tidak mereferensikan ./assets/${SRC_NAME} tepat 1 kali.`);
   fs.writeFileSync(appHtmlPath, html.replace(ref, `./assets/${OUT_NAME}`), 'utf8');
   console.log(`app.html diarahkan ke assets/${OUT_NAME}`);
 }

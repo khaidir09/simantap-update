@@ -40,6 +40,7 @@ require_once __DIR__ . '/lesson_access.php';
 require_once __DIR__ . '/teacher_subject_access.php';
 require_once __DIR__ . '/rekap_bulanan.php';
 require_once __DIR__ . '/pantau_nilai.php';
+require_once __DIR__ . '/portal_nilai.php';
 require_once __DIR__ . '/persetujuan_jurnal.php';
 
 $action = $_GET['action'] ?? '';
@@ -2364,6 +2365,19 @@ switch ($action) {
 
     case 'cetak_rekap_nilai_siswa':
         handleCetakRekapNilaiSiswa($db);
+        break;
+
+    // --- PORTAL NILAI ORANG TUA: kelola PIN & saklar (docs/specs/portal-nilai-orang-tua.md) ---
+    case 'portal_nilai_status':
+        handlePortalNilaiStatus($db);
+        break;
+
+    case 'cetak_kartu_akses':
+        handleCetakKartuAkses($db);
+        break;
+
+    case 'portal_nilai_set_aktif':
+        handlePortalNilaiSetAktif($db);
         break;
 
     default:

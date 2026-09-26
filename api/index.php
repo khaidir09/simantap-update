@@ -41,6 +41,7 @@ require_once __DIR__ . '/teacher_subject_access.php';
 require_once __DIR__ . '/rekap_bulanan.php';
 require_once __DIR__ . '/pantau_nilai.php';
 require_once __DIR__ . '/presensi_harian.php';
+require_once __DIR__ . '/dispensasi.php';
 require_once __DIR__ . '/portal_nilai.php';
 require_once __DIR__ . '/persetujuan_jurnal.php';
 
@@ -568,13 +569,13 @@ switch ($action) {
             // termasuk siswa/tanggal lama bila jurnal diedit (lihat presensi_harian.php).
             $sinkron = [];
             if (!$isDraft) {
-                $sinkron[$date] = array_keys(pantauNilaiParseAttendance($studentAttendance));
+                $sinkron[$date] = array_keys(presensiParseJurnal($studentAttendance));
             }
             if ($existing && !(int)$existing['isDraft']) {
                 $oldDate = (string)$existing['date'];
                 $sinkron[$oldDate] = array_merge(
                     $sinkron[$oldDate] ?? [],
-                    array_keys(pantauNilaiParseAttendance($existing['studentAttendance']))
+                    array_keys(presensiParseJurnal($existing['studentAttendance']))
                 );
             }
             foreach ($sinkron as $tgl => $ids) {
@@ -622,7 +623,7 @@ switch ($action) {
             // Presensi harian siswa di jurnal ini dihitung ulang tanpa jurnal yang dihapus
             if ($jurnalLama && !(int)$jurnalLama['isDraft']) {
                 presensiSinkronHarian($db, (string)$jurnalLama['date'],
-                    array_keys(pantauNilaiParseAttendance($jurnalLama['studentAttendance'])), $user);
+                    array_keys(presensiParseJurnal($jurnalLama['studentAttendance'])), $user);
             }
             $db->commit();
         } catch (Throwable $e) {
@@ -2314,6 +2315,31 @@ switch ($action) {
 
     case 'portal_nilai_set_aktif':
         handlePortalNilaiSetAktif($db);
+        break;
+
+    // --- DISPENSASI SISWA (docs/patches/dispensasi-siswa.md) ---
+    case 'dispensasi_list':
+        handleDispensasiList($db);
+        break;
+
+    case 'dispensasi_siswa':
+        handleDispensasiSiswa($db);
+        break;
+
+    case 'dispensasi_simpan':
+        handleDispensasiSimpan($db);
+        break;
+
+    case 'dispensasi_hapus':
+        handleDispensasiHapus($db);
+        break;
+
+    case 'dispensasi_unggah_surat':
+        handleDispensasiUnggahSurat($db);
+        break;
+
+    case 'dispensasi_jurnal':
+        handleDispensasiJurnal($db);
         break;
 
     default:

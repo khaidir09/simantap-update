@@ -61,16 +61,16 @@ otomatis mendapat insiden pelanggaran `TINGGAL_JP` (id `inc_tjp_<siswa>_<tanggal
 
 | File | Jenis | SHA-256 setelah patch |
 |---|---|---|
-| `api/presensi_harian.php` | baru: `presensiTurunkanHarian`, `presensiJamAlfa`, `presensiPoinTinggalJp`, `presensiKonfigInsiden`, `presensiSinkronInsiden(Alfa)`, `presensiSinkronHarian` | `ed2fcb7ff22f0edc2d2a7606aa7a446bf6c8adf6402381b977c77a87dee82383` |
-| `api/index.php` | ubah: `require_once` setelah `pantau_nilai.php`; `save_journal` memakai `presensiSinkronHarian` untuk tanggal baru dan lama; `delete_journal` dalam transaksi + sinkron | `66447719f5429c93fa181a789f85b301539dd636cda85326b4e8f69a72815427` |
+| `api/presensi_harian.php` | baru: `presensiTurunkanHarian`, `presensiJamAlfa`, `presensiPoinTinggalJp`, `presensiKonfigInsiden`, `presensiSinkronInsiden(Alfa)`, `presensiSinkronHarian` | `a7c7ea12316184baae8cce629370740f38ab57d0ff45351c6e59ddb87939dd78` |
+| `api/index.php` | ubah: `require_once` setelah `pantau_nilai.php`; `save_journal` memakai `presensiSinkronHarian` untuk tanggal baru dan lama; `delete_journal` dalam transaksi + sinkron | `50e1536c678fa180b3122cd5ac0590f99129e0b565318832a2b94cad8c3af829` |
 | `api/endpoints_v2.php` | ubah: `save_attendance_records` memakai `presensiSinkronInsidenAlfa` (status panggilan orang tua tetap `PARENT_INVITED`), lalu `presensiSinkronHarian` per tanggal untuk insiden `TINGGAL_JP` | `928e90d4c6ffbfefd51fc50b568c78a691532de4a40d86fd143aa9c43d27a52b` |
 | `docs/patches/uji-presensi-harian-unit.php` | baru: uji aturan status harian (tanpa DB) | – |
 | `docs/patches/uji-presensi-harian-db.php` | baru: uji integrasi DB, semua data di-rollback | – |
 | `docs/patches/uji-presensi-harian-api.mjs`, `-seed.sql`, `-cleanup.sql` | baru: uji HTTP dan data ujinya | – |
 
-Hash `api/index.php` dan `api/endpoints_v2.php` hanya berlaku bila file itu tidak berubah karena patch lain.
-`api/presensi_harian.php` bergantung pada `pantauNilaiParseAttendance`/`pantauNilaiAttendanceStatus`
-dari `api/pantau_nilai.php` dan `activeAcademicPeriod` dari `api/kesiswaan_access.php`.
+Hash `api/presensi_harian.php` dan `api/index.php` sudah termasuk patch Dispensasi Siswa (`docs/patches/dispensasi-siswa.md`). Hash `api/index.php` dan `api/endpoints_v2.php` hanya berlaku bila file itu tidak berubah karena patch lain.
+`api/presensi_harian.php` (sejak patch Dispensasi memakai parser sendiri `presensiParseJurnal`) bergantung pada
+`activeAcademicPeriod` dari `api/kesiswaan_access.php`.
 
 **Skema:** tidak ada perubahan skema. Kolom `attendance_records.notes` sudah ada di skema dasar.
 **Data:** baris `violation_types` `TINGGAL_JP` ditambahkan otomatis saat pertama dibutuhkan.
@@ -79,8 +79,8 @@ dari `api/pantau_nilai.php` dan `activeAcademicPeriod` dari `api/kesiswaan_acces
 ## 4. Pengujian
 
 ```
-php docs/patches/uji-presensi-harian-unit.php          # 14 uji
-php docs/patches/uji-presensi-harian-db.php            # 31 uji, data di-rollback
+php docs/patches/uji-presensi-harian-unit.php          # 44 uji (termasuk dispensasi)
+php docs/patches/uji-presensi-harian-db.php            # 39 uji, data di-rollback
 mysql -uroot simantap < docs/patches/uji-presensi-harian-seed.sql
 node docs/patches/uji-presensi-harian-api.mjs          # 12 uji lewat HTTP
 mysql -uroot simantap < docs/patches/uji-presensi-harian-cleanup.sql

@@ -7,6 +7,7 @@ require __DIR__ . '/../../api/db.php';
 require __DIR__ . '/../../api/kesiswaan_access.php';
 require __DIR__ . '/../../api/pantau_nilai.php';
 require __DIR__ . '/../../api/presensi_harian.php';
+require __DIR__ . '/../../api/dispensasi.php';
 
 $db = getDB();
 $pass = 0; $failed = 0;
@@ -73,9 +74,20 @@ function manual(mysqli $db, string $sid, string $status): void
     presensiSinkronHarian($db, TGL, [$sid], $aktor);
 }
 
+dispensasiPastikanTabel($db); // DDL harus di luar transaksi uji
+const S3 = 's_uji_ph_3';
+function dispensasi(mysqli $db, string $id, string $sid, ?int $mulai, ?int $selesai, string $kegiatan): void
+{
+    $stmt = $db->prepare("INSERT INTO student_dispensations (id, student_id, student_name, class_id, class_name, tanggal_mulai, tanggal_selesai,
+        jam_ke_mulai, jam_ke_selesai, kegiatan, dicatat_oleh, dicatat_oleh_nama) VALUES (?, ?, 'Siswa', ?, 'X UJI', ?, ?, ?, ?, ?, 'u', 'U')");
+    $tgl = TGL; $kls = KLS;
+    $stmt->bind_param("sssssiis", $id, $sid, $kls, $tgl, $tgl, $mulai, $selesai, $kegiatan);
+    $stmt->execute();
+}
+
 $db->begin_transaction();
 try {
-    foreach ([S1, S2] as $sid) {
+    foreach ([S1, S2, S3] as $sid) {
         $db->query("INSERT INTO students (id, nisn, name, class_id, class_name) VALUES ('$sid', '99$sid', 'Siswa $sid', '" . KLS . "', 'X UJI')");
     }
     $konfig   = presensiKonfigInsiden($db);
@@ -180,6 +192,46 @@ try {
     jurnal($db, 'j_uji_ph_a', '4', [S2 => 'SAKIT']);
     sinkron($db, [S2]);
     cek('T10 HADIR + SAKIT tanpa TINGGAL_JP', rekaman($db, S2)['status'] === 'HADIR' && insidenTjp($db, S2) === null);
+
+    // 11. Dispensasi susulan jam 3-8 mencabut TINGGAL_JP
+    jurnal($db, 'j_uji_ph_s1', '1', [S3 => 'HADIR']);
+    jurnal($db, 'j_uji_ph_s3', '3-4', [S3 => 'ALFA']);
+    sinkron($db, [S3]);
+    cek('D1 sebelum dispensasi: TINGGAL_JP', insidenTjp($db, S3) !== null && poin($db, S3) === $tjpPoin);
+    dispensasi($db, 'disp_uji_1', S3, 3, 8, 'Lomba OSN');
+    $ubah = sinkron($db, [S3]);
+    $r = rekaman($db, S3);
+    cek('D1 dispensasi mencabut TINGGAL_JP', insidenTjp($db, S3) === null && poin($db, S3) === 0 && ($ubah[S3]['tinggal_jp'] ?? '') === 'dihapus', var_export($ubah, true));
+    cek('D1 catatan dispensasi', $r['status'] === 'HADIR' && str_contains((string)$r['notes'], 'jam 3-4 (Mapel3-4): DISPENSASI (Lomba OSN)'), (string)$r['notes']);
+
+    // 12. Jam di luar cakupan dispensasi tetap meninggalkan jam pelajaran
+    jurnal($db, 'j_uji_ph_s9', '9', [S3 => 'ALFA']);
+    sinkron($db, [S3]);
+    $tjp = insidenTjp($db, S3);
+    cek('D2 jam 9 di luar dispensasi 3-8 -> TINGGAL_JP jam 9 saja', $tjp && str_contains($tjp['details'], 'jam 9') && !str_contains($tjp['details'], 'jam 3'), var_export($tjp, true));
+    hapusJurnal($db, 'j_uji_ph_s9');
+
+    // 13. Tanpa jam HADIR: semua jam dicakup dispensasi -> HADIR, tanpa insiden
+    hapusJurnal($db, 'j_uji_ph_s1');
+    sinkron($db, [S3]);
+    cek('D3 hanya jam dispensasi -> HADIR tanpa insiden', rekaman($db, S3)['status'] === 'HADIR' && !insiden($db, S3) && insidenTjp($db, S3) === null);
+
+    // 14. Dispensasi dihapus -> ALFA kembali
+    $db->query("DELETE FROM student_dispensations WHERE id = 'disp_uji_1'");
+    sinkron($db, [S3]);
+    cek('D4 dispensasi dihapus -> ALFA + insiden', rekaman($db, S3)['status'] === 'ALFA' && insiden($db, S3) && poin($db, S3) === $alfaPoin);
+
+    // 15. Dispensasi sehari penuh mencakup jam jurnal yang tidak terbaca
+    jurnal($db, 'j_uji_ph_s3', '', [S3 => 'ALFA']);
+    dispensasi($db, 'disp_uji_2', S3, null, null, 'Paskibra');
+    sinkron($db, [S3]);
+    cek('D5 sehari penuh -> HADIR, insiden ALFA dicabut', rekaman($db, S3)['status'] === 'HADIR' && !insiden($db, S3) && poin($db, S3) === 0);
+
+    // 16. Guru menandai D langsung (tanpa data dispensasi) tetap dihitung hadir
+    $db->query("DELETE FROM student_dispensations WHERE id = 'disp_uji_2'");
+    jurnal($db, 'j_uji_ph_s3', '3', [S3 => 'DISPENSASI']);
+    sinkron($db, [S3]);
+    cek('D6 status D dari guru -> HADIR', rekaman($db, S3)['status'] === 'HADIR' && !insiden($db, S3));
 } catch (Throwable $e) {
     $failed++;
     echo "ERROR " . $e->getMessage() . "\n";

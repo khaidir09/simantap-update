@@ -43,6 +43,7 @@ The files are split by development phase, not by domain:
 | `api/endpoints_v2.php` | legacy student CRUD, violation types, `get_config`/`save_config`, attendance records, parent calls |
 | `api/endpoints_v3.php` | homeroom dashboards, extracurricular members/activities, `save_user_v2`, classes |
 | `api/endpoints_tu.php` | staff (GTK), students (TU version), file upload/delete, letters, legalization, inventory, rooms/bookings, archive, staff attendance |
+| `api/dispensasi.php` | student dispensations (`dispensasi_*` actions, dispatched by explicit `case`s in `index.php`); table `student_dispensations` is created on first use. See `docs/patches/dispensasi-siswa.md` |
 
 Several parallel legacy/current endpoint pairs exist and the bundle uses both sides:
 - users: `save_user` vs `save_user_v2`;

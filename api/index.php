@@ -39,6 +39,7 @@ require_once __DIR__ . '/ekskul_access.php';
 require_once __DIR__ . '/lesson_access.php';
 require_once __DIR__ . '/teacher_subject_access.php';
 require_once __DIR__ . '/rekap_bulanan.php';
+require_once __DIR__ . '/pantau_nilai.php';
 require_once __DIR__ . '/persetujuan_jurnal.php';
 
 $action = $_GET['action'] ?? '';
@@ -2350,6 +2351,19 @@ switch ($action) {
     // --- REKAP BULANAN WALI KELAS (halaman HTML siap cetak, lihat api/rekap_bulanan.php) ---
     case 'cetak_rekap_bulanan':
         handleCetakRekapBulanan($db);
+        break;
+
+    // --- PANTAU NILAI KELAS: wali kelas & guru BK, hanya baca (docs/specs/pantau-nilai-wali-kelas.md) ---
+    case 'get_class_grade_overview':
+        handleGetClassGradeOverview($db);
+        break;
+
+    case 'get_class_subject_grade_detail':
+        handleGetClassSubjectGradeDetail($db);
+        break;
+
+    case 'cetak_rekap_nilai_siswa':
+        handleCetakRekapNilaiSiswa($db);
         break;
 
     default:

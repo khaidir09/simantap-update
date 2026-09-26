@@ -39,7 +39,7 @@ The files are split by development phase, not by domain:
 
 | File | Domains |
 |---|---|
-| `api/index.php` | auth/session, users, journals (`save_journal` also writes attendance, ALFA incidents, violation points, and auto parent calls), forum, incidents, general activities, extracurriculars, RPP, notifications, subjects, `system_config`, grades, profile, uploads |
+| `api/index.php` | auth/session, users, journals (`save_journal`/`delete_journal` recompute daily attendance, ALFA incidents, violation points, and auto parent calls via `presensi_harian.php`; see `docs/patches/presensi-harian-jurnal.md`), forum, incidents, general activities, extracurriculars, RPP, notifications, subjects, `system_config`, grades, profile, uploads |
 | `api/endpoints_v2.php` | legacy student CRUD, violation types, `get_config`/`save_config`, attendance records, parent calls |
 | `api/endpoints_v3.php` | homeroom dashboards, extracurricular members/activities, `save_user_v2`, classes |
 | `api/endpoints_tu.php` | staff (GTK), students (TU version), file upload/delete, letters, legalization, inventory, rooms/bookings, archive, staff attendance |

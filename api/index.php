@@ -40,6 +40,7 @@ require_once __DIR__ . '/lesson_access.php';
 require_once __DIR__ . '/teacher_subject_access.php';
 require_once __DIR__ . '/rekap_bulanan.php';
 require_once __DIR__ . '/pantau_nilai.php';
+require_once __DIR__ . '/presensi_harian.php';
 require_once __DIR__ . '/portal_nilai.php';
 require_once __DIR__ . '/persetujuan_jurnal.php';
 
@@ -465,7 +466,7 @@ switch ($action) {
         // Cek kepemilikan dan kunci verifikasi sebelum transaksi, agar presensi/insiden
         // tidak ikut tertulis saat ditolak. Selain ADMIN/KEPALA_SEKOLAH hanya boleh mengubah
         // jurnal miliknya sendiri yang belum diverifikasi.
-        $stmtOld = $db->prepare("SELECT teacherId, isVerified, verifiedBy, verifiedAt FROM journal_entries WHERE id = ?");
+        $stmtOld = $db->prepare("SELECT teacherId, isVerified, verifiedBy, verifiedAt, date, studentAttendance, isDraft FROM journal_entries WHERE id = ?");
         $stmtOld->bind_param("s", $id);
         $stmtOld->execute();
         $existing = $stmtOld->get_result()->fetch_assoc();
@@ -563,100 +564,21 @@ switch ($action) {
                 throw new Exception("Gagal insert journal_entries: " . $stmt->error);
             }
 
-            // Insert into attendance_records if not draft and attendance exists
-            if (!$isDraft && is_array($attendanceRaw) && !empty($attendanceRaw)) {
-                // Get active year/semester
-                $resYear = $db->query("SELECT config_value FROM system_config WHERE config_key = 'active_academic_year'");
-                $yearRow = $resYear->fetch_assoc();
-                $academicYear = $yearRow['config_value'] ?? '2025/2026';
-
-                $resSem = $db->query("SELECT config_value FROM system_config WHERE config_key = 'active_semester'");
-                $semRow = $resSem->fetch_assoc();
-                $semester = $semRow['config_value'] ?? 'GANJIL';
-
-                $resThresh = $db->query("SELECT config_value FROM system_config WHERE config_key = 'violation_threshold_parentcall'");
-                $threshRow = $resThresh->fetch_assoc();
-                $threshold = (int)($threshRow['config_value'] ?? 75);
-
-                $resAlfa = $db->query("SELECT points FROM violation_types WHERE violation_code = 'ALFA'");
-                $alfaRow = $resAlfa ? $resAlfa->fetch_assoc() : null;
-                $alfaPoints = (int)($alfaRow['points'] ?? 15);
-
-                $stmtUpsert = $db->prepare(
-                    "INSERT INTO attendance_records
-                        (id, student_id, student_name, class_id, class_name, date, semester, academic_year, status, recorded_by, recorder_name, source)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'JURNAL')
-                     ON DUPLICATE KEY UPDATE
-                        status = IF(attendance_records.source = 'MANUAL', attendance_records.status, VALUES(status)),
-                        recorded_by = IF(attendance_records.source = 'MANUAL', attendance_records.recorded_by, VALUES(recorded_by)),
-                        recorder_name = IF(attendance_records.source = 'MANUAL', attendance_records.recorder_name, VALUES(recorder_name)),
-                        source = IF(attendance_records.source = 'MANUAL', 'MANUAL', 'JURNAL')"
+            // Presensi harian dihitung ulang dari semua jurnal non-draf pada tanggal itu,
+            // termasuk siswa/tanggal lama bila jurnal diedit (lihat presensi_harian.php).
+            $sinkron = [];
+            if (!$isDraft) {
+                $sinkron[$date] = array_keys(pantauNilaiParseAttendance($studentAttendance));
+            }
+            if ($existing && !(int)$existing['isDraft']) {
+                $oldDate = (string)$existing['date'];
+                $sinkron[$oldDate] = array_merge(
+                    $sinkron[$oldDate] ?? [],
+                    array_keys(pantauNilaiParseAttendance($existing['studentAttendance']))
                 );
-
-                // Need student names, let's fetch all students for this class
-                $resStudents = $db->prepare("SELECT id, name, nisn FROM students WHERE class_id = ?");
-                $resStudents->bind_param("s", $classId);
-                $resStudents->execute();
-                $studentsArr = [];
-                $sResult = $resStudents->get_result();
-                while ($s = $sResult->fetch_assoc()) {
-                    $studentsArr[$s['id']] = ['name' => $s['name'], 'nisn' => $s['nisn']];
-                }
-
-                foreach ($attendanceRaw as $studentId => $status) {
-                    $sInfo = $studentsArr[$studentId] ?? null;
-                    $studentName = $sInfo ? $sInfo['name'] : 'Unknown Student';
-                    $studentNisn = $sInfo ? $sInfo['nisn'] : null;
-                    $rId = 'att_' . $studentId . '_' . $date;
-
-                    $stmtUpsert->bind_param(
-                        "sssssssssss",
-                        $rId, $studentId, $studentName, $classId, $className,
-                        $date, $semester, $academicYear, $status, $teacherId, $teacherName
-                    );
-                    $stmtUpsert->execute();
-
-                    // Auto-trigger violation for ALFA
-                    $incId = 'inc_att_' . $studentId . '_' . $date;
-                    if ($status === 'ALFA' || $status === 'ALPHA') {
-                        $checkInc = $db->query("SELECT id FROM incidents WHERE id = '$incId'");
-                        if ($checkInc->num_rows === 0) {
-                            $details = "Tidak hadir tanpa keterangan (dari Jurnal $date)";
-                            $stmtInc = $db->prepare(
-                                "INSERT INTO incidents (id, type, date, studentId, student_nisn, studentName, className, academic_year, semester, reporterId, reporterName, details, violation_code, points, status, parent_call_triggered)
-                                 VALUES (?, 'VIOLATION', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ALFA', ?, 'REPORTED', 0)"
-                            );
-                            $stmtInc->bind_param(
-                                "sssssssssssi",
-                                $incId, $date, $studentId, $studentNisn, $studentName, $className, $academicYear, $semester,
-                                $teacherId, $teacherName, $details, $alfaPoints
-                            );
-                            $stmtInc->execute();
-
-                            $db->query("UPDATE students SET total_violation_points = total_violation_points + $alfaPoints WHERE id = '" . $db->real_escape_string($studentId) . "'");
-
-                            $res2 = $db->query("SELECT total_violation_points FROM students WHERE id = '" . $db->real_escape_string($studentId) . "'");
-                            $sRow = $res2->fetch_assoc();
-                            $totalPts = (int)($sRow['total_violation_points'] ?? 0);
-
-                            if ($totalPts >= $threshold) {
-                                $callId = 'pcall_' . $studentId . '_' . time();
-                                $stmtCall = $db->prepare(
-                                    "INSERT IGNORE INTO parent_calls (id, student_id, student_name, class_name, academic_year, semester, total_points, trigger_type, trigger_incident_id, status)
-                                     VALUES (?, ?, ?, ?, ?, ?, ?, 'AUTO', ?, 'PENDING')"
-                                );
-                                $stmtCall->bind_param("ssssssis", $callId, $studentId, $studentName, $className, $academicYear, $semester, $totalPts, $incId);
-                                $stmtCall->execute();
-                            }
-                        }
-                    } else {
-                        $checkInc = $db->query("SELECT id FROM incidents WHERE id = '$incId'");
-                        if ($checkInc->num_rows > 0) {
-                            $db->query("DELETE FROM incidents WHERE id = '$incId'");
-                            $db->query("UPDATE students SET total_violation_points = GREATEST(0, total_violation_points - $alfaPoints) WHERE id = '" . $db->real_escape_string($studentId) . "'");
-                        }
-                    }
-                }
+            }
+            foreach ($sinkron as $tgl => $ids) {
+                presensiSinkronHarian($db, (string)$tgl, $ids, $user);
             }
 
             $db->commit();
@@ -687,13 +609,27 @@ switch ($action) {
             }
         }
 
-        $stmt = $db->prepare("DELETE FROM journal_entries WHERE id = ?");
-        $stmt->bind_param("s", $id);
-        if ($stmt->execute()) {
-            jsonResponse(['success' => true]);
-        } else {
+        $stmtJ = $db->prepare("SELECT date, studentAttendance, isDraft FROM journal_entries WHERE id = ?");
+        $stmtJ->bind_param("s", $id);
+        $stmtJ->execute();
+        $jurnalLama = $stmtJ->get_result()->fetch_assoc();
+
+        $db->begin_transaction();
+        try {
+            $stmt = $db->prepare("DELETE FROM journal_entries WHERE id = ?");
+            $stmt->bind_param("s", $id);
+            $stmt->execute();
+            // Presensi harian siswa di jurnal ini dihitung ulang tanpa jurnal yang dihapus
+            if ($jurnalLama && !(int)$jurnalLama['isDraft']) {
+                presensiSinkronHarian($db, (string)$jurnalLama['date'],
+                    array_keys(pantauNilaiParseAttendance($jurnalLama['studentAttendance'])), $user);
+            }
+            $db->commit();
+        } catch (Throwable $e) {
+            $db->rollback();
             errorResponse('Gagal menghapus jurnal');
         }
+        jsonResponse(['success' => true]);
         break;
 
     case 'upload_journal_photo':

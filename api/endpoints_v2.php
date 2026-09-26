@@ -271,15 +271,11 @@ switch ($action) {
             $records[$i]['status'] = normalizeAttendanceStatus($r['status'] ?? 'HADIR');
         }
 
-        // Get threshold for auto-parent call
-        $resThresh = $db->query("SELECT config_value FROM system_config WHERE config_key = 'violation_threshold_parentcall'");
-        $threshRow = $resThresh->fetch_assoc();
-        $threshold = (int)($threshRow['config_value'] ?? 75);
-
-        // Get ALFA violation points
-        $resAlfa = $db->query("SELECT points FROM violation_types WHERE violation_code = 'ALFA'");
-        $alfaRow = $resAlfa ? $resAlfa->fetch_assoc() : null;
-        $alfaPoints = (int)($alfaRow['points'] ?? 15);
+        $opsiInsiden = presensiKonfigInsiden($db) + [
+            'reporter_id'        => $user['uid'],
+            'reporter_name'      => $user['displayName'],
+            'parent_call_status' => 'PARENT_INVITED',
+        ];
 
         $db->begin_transaction();
         try {
@@ -294,6 +290,7 @@ switch ($action) {
                     source = 'MANUAL'"
             );
 
+            $sinkron = [];
             foreach ($records as $r) {
                 $rId          = 'att_' . $r['student_id'] . '_' . $r['date'];
                 $studentId    = $r['student_id'];
@@ -312,52 +309,25 @@ switch ($action) {
                 );
                 $stmtUpsert->execute();
 
-                // Auto-trigger violation for ALFA
-                $incId = 'inc_att_' . $studentId . '_' . $date;
-                if ($status === 'ALFA') {
-                    $checkInc = $db->query("SELECT id FROM incidents WHERE id = '$incId'");
-                    if ($checkInc->num_rows === 0) {
-                        $getNisn = $db->query("SELECT nisn FROM students WHERE id = '" . $db->real_escape_string($studentId) . "'");
-                        $sInfo = $getNisn->fetch_assoc();
-                        $studentNisn = $sInfo ? $sInfo['nisn'] : null;
-                        
-                        $details = "Tidak hadir tanpa keterangan (dari presensi $date)";
-                        $stmtInc = $db->prepare(
-                            "INSERT INTO incidents (id, type, date, studentId, student_nisn, studentName, className, academic_year, semester, reporterId, reporterName, details, violation_code, points, status, parent_call_triggered)
-                             VALUES (?, 'VIOLATION', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ALFA', ?, 'REPORTED', 0)"
-                        );
-                        $stmtInc->bind_param(
-                            "sssssssssssi",
-                            $incId, $date, $studentId, $studentNisn, $studentName, $className, $academicYear, $semester,
-                            $user['uid'], $user['displayName'], $details, $alfaPoints
-                        );
-                        $stmtInc->execute();
+                // Insiden ALFA mengikuti status MANUAL yang baru disimpan
+                $getNisn = $db->prepare("SELECT nisn FROM students WHERE id = ?");
+                $getNisn->bind_param("s", $studentId);
+                $getNisn->execute();
+                $sInfo = $getNisn->get_result()->fetch_assoc();
+                presensiSinkronInsidenAlfa($db, [
+                    'id'         => $studentId,
+                    'name'       => $studentName,
+                    'nisn'       => $sInfo['nisn'] ?? null,
+                    'class_name' => $className,
+                ], $date, $status === 'ALFA', $opsiInsiden + [
+                    'details' => "Tidak hadir tanpa keterangan (dari presensi $date)",
+                ]);
+                $sinkron[$date][] = $studentId;
+            }
 
-                        // Update total_violation_points
-                        $db->query("UPDATE students SET total_violation_points = total_violation_points + $alfaPoints WHERE id = '" . $db->real_escape_string($studentId) . "'");
-
-                        // Check threshold
-                        $res2 = $db->query("SELECT total_violation_points, name, class_name FROM students WHERE id = '" . $db->real_escape_string($studentId) . "'");
-                        $sRow = $res2->fetch_assoc();
-                        $totalPts = (int)($sRow['total_violation_points'] ?? 0);
-
-                        if ($totalPts >= $threshold) {
-                            $callId = 'pcall_' . $studentId . '_' . time();
-                            $stmtCall = $db->prepare(
-                                "INSERT IGNORE INTO parent_calls (id, student_id, student_name, class_name, academic_year, semester, total_points, trigger_type, trigger_incident_id, status)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?, 'AUTO', ?, 'PARENT_INVITED')"
-                            );
-                            $stmtCall->bind_param("ssssssis", $callId, $studentId, $studentName, $className, $academicYear, $semester, $totalPts, $incId);
-                            $stmtCall->execute();
-                        }
-                    }
-                } else {
-                    $checkInc = $db->query("SELECT id FROM incidents WHERE id = '$incId'");
-                    if ($checkInc->num_rows > 0) {
-                        $db->query("DELETE FROM incidents WHERE id = '$incId'");
-                        $db->query("UPDATE students SET total_violation_points = GREATEST(0, total_violation_points - $alfaPoints) WHERE id = '" . $db->real_escape_string($studentId) . "'");
-                    }
-                }
+            // Insiden TINGGAL_JP (hadir tetapi ada jam pelajaran ALFA) mengikuti status MANUAL baru
+            foreach ($sinkron as $tgl => $ids) {
+                presensiSinkronHarian($db, (string)$tgl, $ids, $user);
             }
 
             $db->commit();

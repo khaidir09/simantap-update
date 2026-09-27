@@ -171,7 +171,7 @@ function normalizeAttendanceStatus(?string $status): string
  */
 function activeAcademicPeriod(mysqli $db): array
 {
-    $config = ['active_academic_year' => '2025/2026', 'active_semester' => 'GANJIL'];
+    $config = ['active_academic_year' => defaultAcademicYear(), 'active_semester' => 'GANJIL'];
     $stmt = $db->prepare("SELECT config_key, config_value FROM system_config WHERE config_key IN ('active_academic_year', 'active_semester')");
     $stmt->execute();
     $res = $stmt->get_result();

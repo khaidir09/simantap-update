@@ -81,10 +81,18 @@ function requireRole(array $roles): array
     return $user;
 }
 
-// Tahun ajaran & semester aktif dari system_config (fallback ke nilai lama)
+// Tahun ajaran default jika system_config belum diisi: dihitung dari tanggal hari ini
+// (Juli–Desember = tahun ini/tahun depan, Januari–Juni = tahun lalu/tahun ini)
+function defaultAcademicYear(): string
+{
+    $y = (int)date('Y');
+    return (int)date('n') >= 7 ? $y . '/' . ($y + 1) : ($y - 1) . '/' . $y;
+}
+
+// Tahun ajaran & semester aktif dari system_config (fallback ke defaultAcademicYear())
 function getActiveAcademicPeriod(mysqli $db): array
 {
-    $period = ['academic_year' => '2025/2026', 'semester' => 'GANJIL'];
+    $period = ['academic_year' => defaultAcademicYear(), 'semester' => 'GANJIL'];
     $res = $db->query("SELECT config_key, config_value FROM system_config WHERE config_key IN ('active_academic_year','active_semester')");
     while ($res && ($row = $res->fetch_assoc())) {
         $val = trim((string)$row['config_value']);

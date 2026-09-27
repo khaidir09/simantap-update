@@ -848,7 +848,7 @@ switch ($action) {
         $studentNisn  = $body['studentNisn'] ?? null;
         $className    = $body['className']   ?? $body['class'] ?? '';
         $classId      = $body['classId']     ?? '';
-        $academicYear = $body['academicYear'] ?? '2025/2026';
+        $academicYear = trim((string)($body['academicYear'] ?? '')) ?: getActiveAcademicPeriod($db)['academic_year'];
         $semester     = $body['semester']    ?? 'GANJIL';
         $reporterId   = $user['uid'];
         $reporterName = $user['displayName'];

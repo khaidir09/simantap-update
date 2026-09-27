@@ -62,7 +62,7 @@ switch ($action) {
         $name = trim($body['name'] ?? '');
         $classId = $body['class_id'] ?? '';
         $className = $body['class_name'] ?? '';
-        $year = $body['academic_year'] ?? '2025/2026';
+        $year = trim((string)($body['academic_year'] ?? '')) ?: getActiveAcademicPeriod($db)['academic_year'];
         $enrollment_year = $body['enrollment_year'] ?? null;
         $status = $body['status'] ?? 'AKTIF';
         $parentName = $body['parent_name'] ?? null;
@@ -95,7 +95,7 @@ switch ($action) {
         requireRole(['ADMIN', 'TATA_USAHA']);
         $body = getRequestBody();
         $students = $body['students'] ?? [];
-        $year = $body['academic_year'] ?? '2025/2026';
+        $year = trim((string)($body['academic_year'] ?? '')) ?: getActiveAcademicPeriod($db)['academic_year'];
 
         if (empty($students)) errorResponse('Data siswa kosong');
 
@@ -468,7 +468,7 @@ switch ($action) {
         $studentId  = $body['student_id']   ?? '';
         $studentName= $body['student_name'] ?? '';
         $className  = $body['class_name']   ?? '';
-        $year       = $body['academic_year']?? '2025/2026';
+        $year       = trim((string)($body['academic_year'] ?? '')) ?: getActiveAcademicPeriod($db)['academic_year'];
         $semester   = $body['semester']     ?? 'GANJIL';
         $notes      = $body['notes']        ?? '';
         $schDate    = $body['scheduled_date']?? null;

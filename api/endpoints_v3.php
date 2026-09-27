@@ -520,7 +520,8 @@ switch ($action) {
                         }
                     } else {
                         // Buat GTK baru dengan id = uid (fresh insert)
-                        $docsDefault = json_encode(['ktp' => true, 'ijazah' => true, 'kk' => false, 'skCpns' => false, 'skPpk' => false, 'skPangkat' => false, 'skBerkala' => false, 'sertifikat' => false]);
+                        // Belum ada berkas; berkas terunggah disimpan sebagai path (string)
+                        $docsDefault = json_encode(new stdClass());
                         $jadwalDefault = json_encode([]);
                         $stmtGtk = $db->prepare(
                             "INSERT IGNORE INTO gtk_pegawai 

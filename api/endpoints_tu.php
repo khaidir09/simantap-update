@@ -47,8 +47,9 @@ switch ($action) {
                 if ($filesRes) {
                     while ($fRow = $filesRes->fetch_assoc()) {
                         $cat = $fRow['kategori'];
-                        // Only set if not already in docs_json or docs_json has false/empty
-                        if (empty($docsRaw[$cat])) {
+                        // Isi jika docs_json belum punya path untuk kategori ini
+                        // (placeholder boolean true/false dari data lama bukan berkas)
+                        if (!is_string($docsRaw[$cat] ?? null) || $docsRaw[$cat] === '') {
                             $docsRaw[$cat] = $fRow['path_file'];
                         }
                     }

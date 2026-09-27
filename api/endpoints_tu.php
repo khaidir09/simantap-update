@@ -140,7 +140,7 @@ switch ($action) {
                   pangkat=VALUES(pangkat), golongan=VALUES(golongan), jabatan=VALUES(jabatan), mapel=VALUES(mapel), 
                   beban_mengajar=VALUES(beban_mengajar), kelas_ajar=VALUES(kelas_ajar), 
                   class_homeroom=VALUES(class_homeroom), is_bk=VALUES(is_bk), 
-                  docs_json=VALUES(docs_json), jadwal_mengajar_json=VALUES(jadwal_mengajar_json),
+                  docs_json=VALUES(docs_json),
                   tempat_lahir=VALUES(tempat_lahir), tanggal_lahir=VALUES(tanggal_lahir),
                   jenis_kelamin=VALUES(jenis_kelamin), agama=VALUES(agama),
                   pendidikan_terakhir=VALUES(pendidikan_terakhir), sertifikasi=VALUES(sertifikasi),
@@ -271,7 +271,13 @@ switch ($action) {
 
     // Partial update — only teaching attribute fields (no biodata risk)
     case 'gtk_update_atribut':
-        $user = requireAuth();
+        // Hanya TU/ADMIN (role dibaca ulang dari DB). Jadwal tetap diterima sebagai jalur legacy
+        // bundle lama; bundle baru memakai jadwal_kbm_save (docs/specs/jadwal-kbm-mandiri-guru.md).
+        $user = loadFreshUser($db, requireAuth());
+        if (!in_array($user['role'], ['TATA_USAHA', 'ADMIN'], true)) {
+            errorResponse('Anda tidak memiliki akses untuk mengubah atribut mengajar GTK.', 403);
+        }
+        if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') errorResponse('Metode tidak diizinkan', 405);
         $body = getRequestBody();
         $gtk_id            = $body['id'] ?? '';
         $beban_mengajar    = $body['beban_mengajar']     ?? null;
@@ -302,10 +308,14 @@ switch ($action) {
         if ($stmt->execute()) {
             // Sync homeroom to users table if provided
             if ($class_homeroom_a !== null) {
-                $db->query("UPDATE users SET class_homeroom='" . $db->real_escape_string($class_homeroom_a) . "' WHERE uid='" . $db->real_escape_string($gtk_id) . "'");
+                $syncU = $db->prepare("UPDATE users SET class_homeroom=? WHERE uid=?");
+                $syncU->bind_param("ss", $class_homeroom_a, $gtk_id);
+                $syncU->execute();
             }
             if ($is_bk_a !== null) {
-                $db->query("UPDATE users SET is_bk=$is_bk_a WHERE uid='" . $db->real_escape_string($gtk_id) . "'");
+                $syncU = $db->prepare("UPDATE users SET is_bk=? WHERE uid=?");
+                $syncU->bind_param("is", $is_bk_a, $gtk_id);
+                $syncU->execute();
             }
 
             // === TWO-WAY SYNC: gtk_pegawai -> teacher_subjects ===

@@ -38,6 +38,7 @@ require_once __DIR__ . '/kesiswaan_access.php';
 require_once __DIR__ . '/ekskul_access.php';
 require_once __DIR__ . '/lesson_access.php';
 require_once __DIR__ . '/teacher_subject_access.php';
+require_once __DIR__ . '/jadwal_kbm.php';
 require_once __DIR__ . '/rekap_bulanan.php';
 require_once __DIR__ . '/pantau_nilai.php';
 require_once __DIR__ . '/presensi_harian.php';
@@ -2340,6 +2341,15 @@ switch ($action) {
 
     case 'dispensasi_jurnal':
         handleDispensasiJurnal($db);
+        break;
+
+    // --- JADWAL KBM (docs/specs/jadwal-kbm-mandiri-guru.md) ---
+    case 'jadwal_kbm_get':
+        jadwalKbmGet($db);
+        break;
+
+    case 'jadwal_kbm_save':
+        jadwalKbmSave($db);
         break;
 
     default:

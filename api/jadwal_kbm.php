@@ -1,0 +1,605 @@
+<?php
+// jadwal_kbm.php - Jadwal KBM per GTK (gtk_pegawai.jadwal_mengajar_json): baca, simpan, validasi
+// Spesifikasi: docs/specs/jadwal-kbm-mandiri-guru.md
+// Hanya boleh dimuat lewat api/index.php (setelah kesiswaan_access.php dan teacher_subject_access.php)
+if (!defined('SIMANTAP_API')) { http_response_code(403); exit('Forbidden'); }
+
+require_once __DIR__ . '/kesiswaan_access.php';
+require_once __DIR__ . '/teacher_subject_access.php';
+
+const JK_HARI       = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat'];
+const JK_JAM_MIN    = 1;
+const JK_JAM_MAKS   = 11;
+const JK_MAKS_ITEM  = 100;
+const JK_MSG_MODUL  = 'Anda tidak memiliki akses ke jadwal KBM.';
+const JK_MSG_BACA   = 'Anda hanya dapat melihat jadwal KBM milik sendiri';
+const JK_MSG_UBAH   = 'Anda hanya dapat mengubah jadwal KBM milik sendiri';
+const JK_MSG_NO_GTK = 'Data kepegawaian (GTK) belum tersedia. Hubungi Tata Usaha.';
+const JK_MSG_KONFLIK = 'Jadwal telah diubah oleh pengguna lain. Muat ulang lalu ulangi perubahan Anda.';
+
+// ---------------------------------------------------------------------------
+// Helper murni (tanpa DB) — diuji oleh docs/patches/uji-jadwal-kbm-unit.php
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalisasi jam dinding ke "HH:MM". Menerima H:MM, HH:MM, HH.MM, dan HH:MM:SS. Invalid -> null.
+ */
+function jkNormJam($nilai): ?string
+{
+    if (!is_string($nilai) && !is_int($nilai)) return null;
+    if (!preg_match('/^\s*(\d{1,2})[.:](\d{2})(?::\d{2})?\s*$/', (string)$nilai, $m)) return null;
+    $h = (int)$m[1];
+    $i = (int)$m[2];
+    if ($h > 23 || $i > 59) return null;
+    return sprintf('%02d:%02d', $h, $i);
+}
+
+/**
+ * Bilangan bulat jam ke (1..JK_JAM_MAKS) dari int atau string angka. Invalid -> null.
+ */
+function jkJamKeValid($nilai): ?int
+{
+    if (is_int($nilai)) {
+        $n = $nilai;
+    } elseif (is_string($nilai) && preg_match('/^\s*\d{1,2}\s*$/', $nilai)) {
+        $n = (int)$nilai;
+    } elseif (is_float($nilai) && floor($nilai) === $nilai) {
+        $n = (int)$nilai;
+    } else {
+        return null;
+    }
+    return ($n >= JK_JAM_MIN && $n <= JK_JAM_MAKS) ? $n : null;
+}
+
+/**
+ * Parse teks "Jam Ke / Waktu KBM" lama, mis. "08 - 11 (13.15 - 16.30)".
+ * Hasil: [jamKeMulai, jamKeSelesai, jamMulai, jamSelesai]; bagian yang gagal bernilai null.
+ */
+function jkParseJamKe(string $teks): array
+{
+    $hasil = ['jamKeMulai' => null, 'jamKeSelesai' => null, 'jamMulai' => null, 'jamSelesai' => null];
+    $t = mb_strtolower($teks);
+    $t = str_replace(["\u{2013}", "\u{2014}", 's.d.', 's.d', 's/d', 'sampai'], '-', $t);
+    $t = preg_replace('/\bsd\b/', '-', $t);
+
+    // Waktu: rentang pertama HH.MM - HH.MM
+    if (preg_match('/(\d{1,2})[.:](\d{2})\s*-\s*(\d{1,2})[.:](\d{2})/', $t, $m)) {
+        $mulai   = jkNormJam($m[1] . ':' . $m[2]);
+        $selesai = jkNormJam($m[3] . ':' . $m[4]);
+        if ($mulai !== null && $selesai !== null && $mulai < $selesai) {
+            $hasil['jamMulai']   = $mulai;
+            $hasil['jamSelesai'] = $selesai;
+        }
+        $t = str_replace($m[0], ' ', $t);
+    }
+
+    // Jam ke: rentang a - b di sisa teks, atau angka tunggal pertama
+    $a = $b = null;
+    if (preg_match('/(\d{1,2})\s*-\s*(\d{1,2})/', $t, $m)) {
+        [$a, $b] = [(int)$m[1], (int)$m[2]];
+        if ($a > $b) [$a, $b] = [$b, $a];
+    } elseif (preg_match('/\d{1,2}/', $t, $m)) {
+        $a = $b = (int)$m[0];
+    }
+    if ($a !== null && jkJamKeValid($a) !== null && jkJamKeValid($b) !== null) {
+        $hasil['jamKeMulai']   = $a;
+        $hasil['jamKeSelesai'] = $b;
+    }
+    return $hasil;
+}
+
+/**
+ * Teks turunan "a - b (HH:MM - HH:MM)" (atau "a (…)" bila a = b) untuk tampilan lama.
+ */
+function jkTeksJamKe(int $a, int $b, string $mulai, string $selesai): string
+{
+    $jam = $a === $b ? (string)$a : $a . ' - ' . $b;
+    return $jam . ' (' . $mulai . ' - ' . $selesai . ')';
+}
+
+/**
+ * Apakah rentang jam ke [a1..b1] dan [a2..b2] beririsan (batas inklusif).
+ */
+function jkRentangBeririsan(int $a1, int $b1, int $a2, int $b2): bool
+{
+    return $a1 <= $b2 && $a2 <= $b1;
+}
+
+/**
+ * Label "jam ke-a–b" (atau "jam ke-a").
+ */
+function jkLabelJamKe(int $a, int $b): string
+{
+    return 'jam ke-' . ($a === $b ? $a : $a . "\u{2013}" . $b);
+}
+
+/**
+ * Hari kanonik (Senin..Jumat) tanpa beda huruf besar/kecil. Invalid -> null.
+ */
+function jkHari($nilai): ?string
+{
+    if (!is_string($nilai)) return null;
+    $v = mb_strtolower(trim($nilai));
+    foreach (JK_HARI as $h) {
+        if (mb_strtolower($h) === $v) return $h;
+    }
+    return null;
+}
+
+/**
+ * Versi jadwal untuk deteksi konflik simpan: sha1 dari nilai kolom mentah (kosong/NULL = "[]").
+ */
+function jkVersi(string $raw): string
+{
+    return sha1(trim($raw) === '' ? '[]' : $raw);
+}
+
+/**
+ * Sesi format baru bila jamKeMulai berupa angka.
+ */
+function jkFormatBaru(array $item): bool
+{
+    return isset($item['jamKeMulai']) && (is_int($item['jamKeMulai']) || is_float($item['jamKeMulai'])
+        || (is_string($item['jamKeMulai']) && ctype_digit(trim($item['jamKeMulai']))));
+}
+
+/**
+ * Nilai efektif satu sesi (format baru maupun lama) + status kelengkapan.
+ * $kelas: hasil jkLoadKelas() (null = tabel classes belum ada).
+ */
+function jkEfektif(array $item, ?array $kelas): array
+{
+    $alasan = [];
+    $legacy = !jkFormatBaru($item);
+
+    $hari = jkHari($item['hari'] ?? null);
+    if ($hari === null) $alasan[] = 'Hari tidak valid';
+
+    // Kelas: format baru memakai classId; format lama me-resolve nama kelas.
+    $refKelas = trim((string)($legacy ? ($item['kelas'] ?? '') : ($item['classId'] ?? '')));
+    $classId  = null;
+    $namaKelas = trim((string)($item['kelas'] ?? $refKelas));
+    if ($kelas === null) {
+        $alasan[] = 'Data kelas belum tersedia';
+    } else {
+        $row = $legacy
+            ? ($kelas['byKey'][normalizeClassKey($refKelas)] ?? null)
+            : ($kelas['byId'][mb_strtolower($refKelas)] ?? null);
+        if ($row) {
+            $classId   = $row['id'];
+            $namaKelas = $row['name'];
+        } else {
+            $alasan[] = 'Kelas "' . ($refKelas !== '' ? $refKelas : '-') . '" tidak ditemukan';
+        }
+    }
+
+    if ($legacy) {
+        $teks = (string)($item['jamKe'] ?? '');
+        $jam  = jkParseJamKe($teks);
+        if ($jam['jamKeMulai'] === null && $jam['jamMulai'] === null) {
+            $alasan[] = 'Jam pelajaran tidak dapat dibaca dari "' . $teks . '"';
+        } elseif ($jam['jamKeMulai'] === null) {
+            $alasan[] = 'Jam ke tidak dapat dibaca dari "' . $teks . '"';
+        } elseif ($jam['jamMulai'] === null) {
+            $alasan[] = 'Jam mulai/selesai belum diisi';
+        }
+        $subjectCode = '';
+        $mapel       = '';
+    } else {
+        $a = jkJamKeValid($item['jamKeMulai'] ?? null);
+        $b = jkJamKeValid($item['jamKeSelesai'] ?? null);
+        $m = jkNormJam($item['jamMulai'] ?? null);
+        $s = jkNormJam($item['jamSelesai'] ?? null);
+        $jam = ['jamKeMulai' => null, 'jamKeSelesai' => null, 'jamMulai' => null, 'jamSelesai' => null];
+        if ($a !== null && $b !== null && $a <= $b) {
+            $jam['jamKeMulai'] = $a;
+            $jam['jamKeSelesai'] = $b;
+        } else {
+            $alasan[] = 'Jam ke tidak valid';
+        }
+        if ($m !== null && $s !== null && $m < $s) {
+            $jam['jamMulai'] = $m;
+            $jam['jamSelesai'] = $s;
+        } else {
+            $alasan[] = 'Jam mulai/selesai tidak valid';
+        }
+        $subjectCode = trim((string)($item['subjectCode'] ?? ''));
+        $mapel       = trim((string)($item['mapel'] ?? ''));
+    }
+
+    return [
+        'efektif' => [
+            'hari'         => $hari,
+            'classId'      => $classId,
+            'kelas'        => $namaKelas,
+            'subjectCode'  => $subjectCode,
+            'mapel'        => $mapel,
+            'jamKeMulai'   => $jam['jamKeMulai'],
+            'jamKeSelesai' => $jam['jamKeSelesai'],
+            'jamMulai'     => $jam['jamMulai'],
+            'jamSelesai'   => $jam['jamSelesai'],
+        ],
+        'legacy'          => $legacy,
+        'perluDilengkapi' => count($alasan) > 0,
+        'alasan'          => $alasan,
+    ];
+}
+
+/**
+ * Kunci pembanding nilai efektif (untuk mendeteksi sesi tersimpan yang tidak berubah).
+ */
+function jkKunciEfektif(array $ef): string
+{
+    return json_encode([
+        $ef['hari'], $ef['classId'] === null ? null : mb_strtolower($ef['classId']),
+        mb_strtolower($ef['subjectCode']), $ef['jamKeMulai'], $ef['jamKeSelesai'], $ef['jamMulai'], $ef['jamSelesai'],
+    ]);
+}
+
+/**
+ * Urutkan sesi respons: hari (Senin->Jumat), lalu jam ke mulai (null di akhir), lalu urutan asal.
+ */
+function jkUrutkan(array $items): array
+{
+    $urut = array_flip(JK_HARI);
+    foreach ($items as $i => &$it) $it['__i'] = $i;
+    unset($it);
+    usort($items, function ($x, $y) use ($urut) {
+        $hx = $urut[$x['efektif']['hari'] ?? ''] ?? 99;
+        $hy = $urut[$y['efektif']['hari'] ?? ''] ?? 99;
+        if ($hx !== $hy) return $hx <=> $hy;
+        $jx = $x['efektif']['jamKeMulai'] ?? 99;
+        $jy = $y['efektif']['jamKeMulai'] ?? 99;
+        if ($jx !== $jy) return $jx <=> $jy;
+        return $x['__i'] <=> $y['__i'];
+    });
+    foreach ($items as &$it) unset($it['__i']);
+    unset($it);
+    return $items;
+}
+
+// ---------------------------------------------------------------------------
+// Helper DB
+// ---------------------------------------------------------------------------
+
+/**
+ * User segar dari DB + cek role. Role di luar $roles ditolak 403.
+ */
+function jkUser(mysqli $db, array $roles): array
+{
+    $fresh = loadFreshUser($db, requireAuth());
+    if (!in_array($fresh['role'], $roles, true)) {
+        errorResponse(JK_MSG_MODUL, 403);
+    }
+    return $fresh;
+}
+
+/**
+ * Master kelas: ['byId' => [id_lower => row], 'byKey' => [normalizeClassKey => row], 'rows' => [...]],
+ * atau null bila tabel classes belum ada. row = ['id','name','level'].
+ */
+function jkLoadKelas(mysqli $db): ?array
+{
+    try {
+        $res = $db->query("SELECT id, name, level FROM classes");
+    } catch (Throwable $e) {
+        return null;
+    }
+    if (!$res) return null;
+    $out = ['byId' => [], 'byKey' => [], 'rows' => []];
+    while ($r = $res->fetch_assoc()) {
+        $row = [
+            'id'    => $r['id'],
+            'name'  => trim((string)($r['name'] ?? '')) !== '' ? $r['name'] : str_replace('_', ' ', $r['id']),
+            'level' => trim((string)($r['level'] ?? '')),
+        ];
+        $out['rows'][] = $row;
+        $out['byId'][mb_strtolower(trim($r['id']))] = $row;
+        foreach ([$r['id'], $row['name']] as $ref) {
+            $k = normalizeClassKey($ref);
+            if ($k !== '' && !isset($out['byKey'][$k])) $out['byKey'][$k] = $row;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Baca jadwal satu GTK. raw = nilai kolom apa adanya (NULL -> ''); rusak = JSON tidak dapat dibaca.
+ */
+function jkLoad(mysqli $db, string $gtkId, bool $kunci = false): array
+{
+    $sql = "SELECT nama, jadwal_mengajar_json FROM gtk_pegawai WHERE id = ? LIMIT 1" . ($kunci ? " FOR UPDATE" : "");
+    $stmt = $db->prepare($sql);
+    $stmt->bind_param("s", $gtkId);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    if (!$row) return ['ada' => false, 'nama' => '', 'raw' => '', 'items' => [], 'rusak' => false];
+
+    $raw   = (string)($row['jadwal_mengajar_json'] ?? '');
+    $items = [];
+    $rusak = false;
+    if (trim($raw) !== '' && trim($raw) !== 'null') {
+        $dec = json_decode($raw, true);
+        if (is_array($dec) && array_is_list($dec)) {
+            foreach ($dec as $it) {
+                if (is_array($it)) $items[] = $it;
+            }
+        } else {
+            $rusak = true;
+        }
+    }
+    return ['ada' => true, 'nama' => (string)$row['nama'], 'raw' => $raw, 'items' => $items, 'rusak' => $rusak];
+}
+
+/**
+ * Item respons: item tersimpan apa adanya + efektif/legacy/perluDilengkapi/alasan, sudah diurutkan.
+ */
+function jkItemsRespons(array $items, ?array $kelas): array
+{
+    $out = [];
+    foreach ($items as $it) {
+        $out[] = array_merge($it, jkEfektif($it, $kelas));
+    }
+    return jkUrutkan($out);
+}
+
+/**
+ * Kelas yang boleh dipilih GURU dari penugasannya. null = semua kelas.
+ * Hasil: [id_lower => true].
+ */
+function jkKelasDiizinkan(array $penugasan, array $kelas): ?array
+{
+    if (count($penugasan) === 0) return null;
+    $izin = [];
+    foreach ($penugasan as $p) {
+        if (count($p['class_ids']) > 0) {
+            foreach ($p['class_ids'] as $cid) $izin[mb_strtolower($cid)] = true;
+        } elseif ($p['class_level'] !== '') {
+            foreach ($kelas['rows'] as $k) {
+                if (mb_strtolower($k['level']) === mb_strtolower($p['class_level'])) $izin[mb_strtolower($k['id'])] = true;
+            }
+        } else {
+            return null;
+        }
+    }
+    return $izin;
+}
+
+/**
+ * Apakah baris penugasan $p mencakup kelas $row (classes).
+ */
+function jkPenugasanMencakup(array $p, array $row): bool
+{
+    if (count($p['class_ids']) > 0) {
+        foreach ($p['class_ids'] as $cid) {
+            if (mb_strtolower($cid) === mb_strtolower($row['id'])) return true;
+        }
+        return false;
+    }
+    if ($p['class_level'] !== '') return mb_strtolower($p['class_level']) === mb_strtolower($row['level']);
+    return true;
+}
+
+/**
+ * Validasi satu sesi baru dan bentuk item tersimpan format baru. Memanggil errorResponse bila gagal.
+ */
+function jkValidasiBaru(array $raw, bool $isGuru, ?array $kelas, array $subjects, array $penugasan): array
+{
+    $hari = jkHari($raw['hari'] ?? null);
+    if ($hari === null) errorResponse('Hari tidak valid');
+
+    $classId = trim((string)($raw['classId'] ?? ''));
+    if ($classId === '') errorResponse('Kelas wajib dipilih');
+    if ($kelas === null) errorResponse('Data kelas belum tersedia');
+    $row = $kelas['byId'][mb_strtolower($classId)] ?? null;
+    if (!$row) errorResponse('Kelas ' . $classId . ' tidak ditemukan');
+
+    if ($isGuru) {
+        $izin = jkKelasDiizinkan($penugasan, $kelas);
+        if ($izin !== null && empty($izin[mb_strtolower($row['id'])])) {
+            errorResponse('Kelas ' . $row['name'] . ' tidak termasuk penugasan mata pelajaran Anda');
+        }
+    }
+
+    $subjectCode = trim((string)($raw['subjectCode'] ?? ''));
+    $mapel = '';
+    if ($subjectCode !== '') {
+        $s = $subjects[mb_strtolower($subjectCode)] ?? null;
+        if (!$s || ($isGuru && !$s['is_active'])) {
+            errorResponse('Mata pelajaran ' . $subjectCode . ' tidak ditemukan atau tidak aktif');
+        }
+        $subjectCode = $s['id'];
+        $mapel       = $s['name'];
+        if ($isGuru && count($penugasan) > 0) {
+            $cocok = false;
+            foreach ($penugasan as $p) {
+                if (mb_strtolower($p['subject_code']) === mb_strtolower($subjectCode) && jkPenugasanMencakup($p, $row)) {
+                    $cocok = true;
+                    break;
+                }
+            }
+            if (!$cocok) errorResponse('Mata pelajaran ' . $mapel . ' tidak ditugaskan untuk kelas ' . $row['name']);
+        }
+    }
+
+    $a = jkJamKeValid($raw['jamKeMulai'] ?? null);
+    $b = jkJamKeValid($raw['jamKeSelesai'] ?? null);
+    if ($a === null || $b === null || $a > $b) errorResponse('Jam ke tidak valid');
+
+    $m = jkNormJam($raw['jamMulai'] ?? null);
+    $s = jkNormJam($raw['jamSelesai'] ?? null);
+    if ($m === null || $s === null) errorResponse('Format jam tidak valid');
+    if ($m >= $s) errorResponse('Jam mulai harus lebih awal dari jam selesai');
+
+    return [
+        'id'           => uniqid('JM-'),
+        'hari'         => $hari,
+        'classId'      => $row['id'],
+        'kelas'        => $row['name'],
+        'subjectCode'  => $subjectCode,
+        'mapel'        => $mapel,
+        'jamKeMulai'   => $a,
+        'jamKeSelesai' => $b,
+        'jamMulai'     => $m,
+        'jamSelesai'   => $s,
+        'jamKe'        => jkTeksJamKe($a, $b, $m, $s),
+    ];
+}
+
+/**
+ * Peringatan (tidak memblokir): sesi baru yang beririsan dengan sesi GTK lain di kelas & hari yang sama.
+ */
+function jkPeringatanAntarGuru(mysqli $db, string $gtkId, array $baru, ?array $kelas): array
+{
+    if (count($baru) === 0) return [];
+    $stmt = $db->prepare("SELECT id, nama, jadwal_mengajar_json FROM gtk_pegawai
+                          WHERE id <> ? AND jadwal_mengajar_json IS NOT NULL AND jadwal_mengajar_json NOT IN ('', '[]', 'null')");
+    $stmt->bind_param("s", $gtkId);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $pesan = [];
+    while ($r = $res->fetch_assoc()) {
+        $dec = json_decode((string)$r['jadwal_mengajar_json'], true);
+        if (!is_array($dec)) continue;
+        foreach ($dec as $it) {
+            if (!is_array($it)) continue;
+            $ef = jkEfektif($it, $kelas);
+            if ($ef['perluDilengkapi']) continue;
+            $e = $ef['efektif'];
+            foreach ($baru as $n) {
+                if ($n['hari'] !== $e['hari'] || mb_strtolower($n['classId']) !== mb_strtolower($e['classId'])) continue;
+                if (!jkRentangBeririsan($n['jamKeMulai'], $n['jamKeSelesai'], $e['jamKeMulai'], $e['jamKeSelesai'])) continue;
+                $teks = 'Kelas ' . $e['kelas'] . ' hari ' . $e['hari'] . ' '
+                      . jkLabelJamKe($e['jamKeMulai'], $e['jamKeSelesai']) . ' juga terjadwal untuk ' . $r['nama'];
+                if (!in_array($teks, $pesan, true)) $pesan[] = $teks;
+            }
+        }
+    }
+    return $pesan;
+}
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
+
+/**
+ * GET jadwal_kbm_get[&gtk_id=]
+ */
+function jadwalKbmGet(mysqli $db): void
+{
+    $aktor = jkUser($db, ['GURU', 'TATA_USAHA', 'ADMIN', 'KEPALA_SEKOLAH']);
+    $gtkId = trim((string)($_GET['gtk_id'] ?? ''));
+    if ($gtkId === '') $gtkId = $aktor['uid'];
+    if ($aktor['role'] === 'GURU' && $gtkId !== $aktor['uid']) errorResponse(JK_MSG_BACA, 403);
+
+    $data = jkLoad($db, $gtkId);
+    if (!$data['ada']) {
+        jsonResponse(['gtk_id' => $gtkId, 'gtkAda' => false, 'versi' => null, 'items' => []]);
+    }
+    $out = [
+        'gtk_id' => $gtkId,
+        'gtkAda' => true,
+        'nama'   => $data['nama'],
+        'versi'  => jkVersi($data['raw']),
+        'items'  => jkItemsRespons($data['items'], jkLoadKelas($db)),
+    ];
+    if ($data['rusak']) $out['alasan'] = ['Data jadwal tidak dapat dibaca'];
+    jsonResponse($out);
+}
+
+/**
+ * POST jadwal_kbm_save  body: {gtk_id, versi, items: [...]}
+ */
+function jadwalKbmSave(mysqli $db): void
+{
+    $aktor = jkUser($db, ['GURU', 'TATA_USAHA', 'ADMIN']);
+    tsRequireMethod(['POST']);
+    $isGuru = $aktor['role'] === 'GURU';
+
+    $body  = getRequestBody();
+    $gtkId = trim((string)($body['gtk_id'] ?? ''));
+    if ($gtkId === '') errorResponse('gtk_id wajib diisi');
+    if ($isGuru && $gtkId !== $aktor['uid']) errorResponse(JK_MSG_UBAH, 403);
+
+    $data = jkLoad($db, $gtkId);
+    if (!$data['ada']) errorResponse(JK_MSG_NO_GTK);
+
+    $items = $body['items'] ?? null;
+    if (!is_array($items) || !array_is_list($items)) errorResponse('Daftar jadwal tidak valid');
+    if (count($items) > JK_MAKS_ITEM) errorResponse('Jadwal maksimal ' . JK_MAKS_ITEM . ' sesi');
+
+    $versi = (string)($body['versi'] ?? '');
+    if ($versi === '') errorResponse('versi wajib diisi');
+    if (!hash_equals(jkVersi($data['raw']), $versi)) errorResponse(JK_MSG_KONFLIK, 409);
+
+    $kelas     = jkLoadKelas($db);
+    $subjects  = tsLoadSubjects($db);
+    $penugasan = $isGuru ? tsLoadRows($db, $gtkId) : [];
+
+    // Sesi tersimpan per id (id pertama yang dipakai; duplikat id berikutnya diperlakukan sebagai sesi baru).
+    $tersimpan = [];
+    foreach ($data['items'] as $it) {
+        $id = trim((string)($it['id'] ?? ''));
+        if ($id !== '' && !isset($tersimpan[$id])) $tersimpan[$id] = $it;
+    }
+
+    $final = [];   // [['item' => tersimpan/baru, 'ef' => efektif, 'lengkap' => bool, 'baru' => bool]]
+    $dipakai = [];
+    foreach ($items as $raw) {
+        if (!is_array($raw)) errorResponse('Format sesi tidak valid');
+        $id = trim((string)($raw['id'] ?? ''));
+        if ($id !== '' && isset($tersimpan[$id]) && empty($dipakai[$id])) {
+            $efLama = jkEfektif($tersimpan[$id], $kelas);
+            $efBody = jkEfektif($raw, $kelas);
+            if (jkKunciEfektif($efLama['efektif']) === jkKunciEfektif($efBody['efektif'])) {
+                $dipakai[$id] = true;
+                $final[] = ['item' => $tersimpan[$id], 'ef' => $efLama['efektif'],
+                            'lengkap' => !$efLama['perluDilengkapi'], 'baru' => false];
+                continue;
+            }
+        }
+        $baru = jkValidasiBaru($raw, $isGuru, $kelas, $subjects, $penugasan);
+        $final[] = ['item' => $baru, 'ef' => jkEfektif($baru, $kelas)['efektif'], 'lengkap' => true, 'baru' => true];
+    }
+
+    // Bentrok jadwal milik sendiri: sesi baru vs sesi lengkap lain pada hari yang sama.
+    foreach ($final as $i => $x) {
+        if (!$x['baru']) continue;
+        foreach ($final as $j => $y) {
+            if ($i === $j || !$y['lengkap'] || $x['ef']['hari'] !== $y['ef']['hari']) continue;
+            if (jkRentangBeririsan($x['ef']['jamKeMulai'], $x['ef']['jamKeSelesai'], $y['ef']['jamKeMulai'], $y['ef']['jamKeSelesai'])) {
+                errorResponse('Jadwal bentrok: ' . $y['ef']['hari'] . ' '
+                    . jkLabelJamKe($y['ef']['jamKeMulai'], $y['ef']['jamKeSelesai']) . ' sudah terisi kelas ' . $y['ef']['kelas']);
+            }
+        }
+    }
+
+    $simpan = array_map(fn($x) => $x['item'], $final);
+    $json   = json_encode(array_values($simpan));
+    if ($json === false) errorResponse('Data jadwal tidak dapat disimpan');
+
+    try {
+        $db->begin_transaction();
+        $kini = jkLoad($db, $gtkId, true);
+        if (!$kini['ada'] || !hash_equals(jkVersi($kini['raw']), $versi)) {
+            $db->rollback();
+            errorResponse(JK_MSG_KONFLIK, 409);
+        }
+        $stmt = $db->prepare("UPDATE gtk_pegawai SET jadwal_mengajar_json = ? WHERE id = ?");
+        $stmt->bind_param("ss", $json, $gtkId);
+        $stmt->execute();
+        $db->commit();
+    } catch (Throwable $e) {
+        try { $db->rollback(); } catch (Throwable $e2) {}
+        error_log('jadwal_kbm_save: ' . $e->getMessage());
+        errorResponse('Gagal menyimpan jadwal KBM', 500);
+    }
+
+    $baruList = array_map(fn($x) => $x['item'], array_filter($final, fn($x) => $x['baru']));
+    jsonResponse([
+        'success'    => true,
+        'versi'      => jkVersi($json),
+        'items'      => jkItemsRespons($simpan, $kelas),
+        'peringatan' => jkPeringatanAntarGuru($db, $gtkId, array_values($baruList), $kelas),
+    ]);
+}

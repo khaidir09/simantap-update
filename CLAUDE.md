@@ -44,6 +44,7 @@ The files are split by development phase, not by domain:
 | `api/endpoints_v3.php` | homeroom dashboards, extracurricular members/activities, `save_user_v2`, classes |
 | `api/endpoints_tu.php` | staff (GTK), students (TU version), file upload/delete, letters, legalization, inventory, rooms/bookings, archive, staff attendance |
 | `api/dispensasi.php` | student dispensations (`dispensasi_*` actions, dispatched by explicit `case`s in `index.php`); table `student_dispensations` is created on first use. See `docs/patches/dispensasi-siswa.md` |
+| `api/jadwal_kbm.php` | teacher KBM schedules in `gtk_pegawai.jadwal_mengajar_json` (`jadwal_kbm_get`/`jadwal_kbm_save`, explicit `case`s in `index.php`): teachers edit their own from Profil, TU/ADMIN edit anyone's; saves require the `versi` hash (409 on conflict); old free-text `jamKe` entries are parsed on read. The journal form auto-fills Jam Ke-/Jam Mulai/Jam Selesai from it. See `docs/specs/jadwal-kbm-mandiri-guru.md` |
 
 Several parallel legacy/current endpoint pairs exist and the bundle uses both sides:
 - users: `save_user` vs `save_user_v2`;
@@ -82,7 +83,7 @@ Good references:
 
 The existing code has serious gaps. Don't use them as templates, and flag them when touching nearby code:
 - **Missing auth on mutations:** `register_guru` is a public signup. Several mutations have no auth at all: `delete_incident`, `delete_general_activity`, `delete_lesson_rpp`, `save_extracurricular`, `delete_extracurricular`, `save_ekskul_journal`, `save_student_registry`.
-- **Weak authorization:** most TU actions only call `requireAuth()`. Record ownership checks are mostly missing. Journals are the exception: `save_journal`/`delete_journal` limit roles other than `ADMIN`/`KEPALA_SEKOLAH` to their own unverified journals, and `save_journal` keeps the verification status from the database. `save_lesson_rpp` still accepts `status` from the body. `save_user`/`save_user_v2` let `TATA_USAHA` and `KEPALA_SEKOLAH` assign the `ADMIN` role.
+- **Weak authorization:** most TU actions only call `requireAuth()` (`gtk_update_atribut` is now limited to `TATA_USAHA`/`ADMIN` and POST). Record ownership checks are mostly missing. Journals are the exception: `save_journal`/`delete_journal` limit roles other than `ADMIN`/`KEPALA_SEKOLAH` to their own unverified journals, and `save_journal` keeps the verification status from the database. `save_lesson_rpp` still accepts `status` from the body. `save_user`/`save_user_v2` let `TATA_USAHA` and `KEPALA_SEKOLAH` assign the `ADMIN` role.
 - **Unauthenticated PII reads:** `gtk_list`, `student_list`, `get_teacher_registry`, `get_student_registry`, and `get_journal_stats` return personal data without login.
 - **Unsafe uploads:**
   - Uploads keep the client-supplied file extension.

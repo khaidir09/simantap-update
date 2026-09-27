@@ -1,0 +1,717 @@
+diff --git a/api/dispensasi.php b/api/dispensasi.php
+new file mode 100644
+index 0000000..66cc31a
+--- /dev/null
++++ b/api/dispensasi.php
+@@ -0,0 +1,415 @@
++<?php
++/**
++ * Dispensasi siswa: murid meninggalkan kelas untuk kegiatan yang diakui sekolah (lomba,
++ * tugas sekolah, dsb.) berdasarkan surat rekomendasi/izin dispensasi.
++ *
++ * - Satu baris per siswa; berlaku dari tanggal_mulai s.d. tanggal_selesai, sehari penuh
++ *   (jam_ke_mulai NULL) atau jam ke-X s.d. Y.
++ * - Diinput ADMIN, KEPALA_SEKOLAH, TATA_USAHA, Guru BK (semua kelas) dan wali kelas
++ *   (kelas perwaliannya). Langsung berlaku tanpa persetujuan.
++ * - Form jurnal mengisi status D (DISPENSASI) otomatis untuk jam yang dicakup.
++ * - Presensi harian (presensi_harian.php) menganggap jam ALFA yang dicakup dispensasi
++ *   sebagai DISPENSASI, yang dihitung hadir. Isi jurnal guru tidak diubah.
++ *
++ * Hanya boleh dimuat lewat api/index.php.
++ */
++if (!defined('SIMANTAP_API')) exit;
++
++const DISPENSASI_MSG_DENY    = 'Anda tidak memiliki akses ke data dispensasi.';
++const DISPENSASI_MAKS_HARI   = 31;
++const DISPENSASI_MAKS_JAM    = 20;
++const DISPENSASI_MAKS_UNGGAH = 5 * 1024 * 1024;
++const DISPENSASI_MIME        = ['application/pdf' => 'pdf', 'image/jpeg' => 'jpg', 'image/png' => 'png'];
++
++/**
++ * Buat tabel bila belum ada. DDL memicu implicit commit, jadi jangan dipanggil di dalam transaksi.
++ */
++function dispensasiPastikanTabel(mysqli $db): void
++{
++    $db->query("CREATE TABLE IF NOT EXISTS `student_dispensations` (
++        `id` varchar(64) NOT NULL,
++        `student_id` varchar(128) NOT NULL,
++        `student_name` varchar(255) NOT NULL,
++        `class_id` varchar(50) NOT NULL,
++        `class_name` varchar(100) NOT NULL,
++        `tanggal_mulai` date NOT NULL,
++        `tanggal_selesai` date NOT NULL,
++        `jam_ke_mulai` tinyint(3) UNSIGNED DEFAULT NULL COMMENT 'NULL = sehari penuh',
++        `jam_ke_selesai` tinyint(3) UNSIGNED DEFAULT NULL,
++        `kegiatan` varchar(255) NOT NULL,
++        `nomor_surat` varchar(100) DEFAULT NULL,
++        `surat_path` varchar(500) DEFAULT NULL COMMENT 'uploads/tu/dispensasi/<yyyymm>/<acak>.<ext>',
++        `dicatat_oleh` varchar(128) NOT NULL,
++        `dicatat_oleh_nama` varchar(255) NOT NULL,
++        `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
++        PRIMARY KEY (`id`),
++        KEY `idx_disp_siswa_tgl` (`student_id`, `tanggal_mulai`, `tanggal_selesai`),
++        KEY `idx_disp_tgl` (`tanggal_mulai`, `tanggal_selesai`)
++    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
++}
++
++/**
++ * Cakupan akses: ALL (ADMIN, KEPALA_SEKOLAH, TATA_USAHA, Guru BK), CLASS (wali kelas), DENY.
++ */
++function dispensasiScope(mysqli $db, array $sessionUser): array
++{
++    $fresh = loadFreshUser($db, $sessionUser);
++    $all   = ['mode' => 'ALL', 'classKeys' => [], 'classId' => null];
++    $deny  = ['mode' => 'DENY', 'classKeys' => [], 'classId' => null];
++
++    if (in_array($fresh['role'], ['ADMIN', 'KEPALA_SEKOLAH', 'TATA_USAHA'], true)) return $all;
++    if ($fresh['role'] !== 'GURU') return $deny;
++    if ((int)$fresh['is_bk'] === 1) return $all;
++    $homeroom = trim((string)($fresh['class_homeroom'] ?? ''));
++    return $homeroom === '' ? $deny : homeroomClassScope($db, $homeroom);
++}
++
++function dispensasiWajibMetode(string $metode): void
++{
++    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== $metode) {
++        header('Allow: ' . $metode);
++        errorResponse('Metode tidak diizinkan', 405);
++    }
++}
++
++function dispensasiTanggalValid($tgl): bool
++{
++    if (!is_string($tgl) || !preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', $tgl, $m)) return false;
++    return checkdate((int)$m[2], (int)$m[3], (int)$m[1]);
++}
++
++/**
++ * Daftar tanggal Y-m-d dari $mulai s.d. $selesai (inklusif).
++ */
++function dispensasiRentangTanggal(string $mulai, string $selesai): array
++{
++    $out = [];
++    $d = new DateTimeImmutable($mulai);
++    $akhir = new DateTimeImmutable($selesai);
++    while ($d <= $akhir) {
++        $out[] = $d->format('Y-m-d');
++        $d = $d->modify('+1 day');
++    }
++    return $out;
++}
++
++/**
++ * Label cakupan jam, mis. "Sehari penuh" atau "Jam ke-3 s.d. 8".
++ */
++function dispensasiLabelCakupan(?int $mulai, ?int $selesai): string
++{
++    if ($mulai === null) return 'Sehari penuh';
++    return $mulai === $selesai ? "Jam ke-$mulai" : "Jam ke-$mulai s.d. $selesai";
++}
++
++/**
++ * Validasi isi body simpan (fungsi murni). Hasil: [data ternormalisasi, pesan galat|null].
++ */
++function dispensasiValidasi(array $body): array
++{
++    $ids = $body['student_ids'] ?? [];
++    if (!is_array($ids)) $ids = [];
++    $ids = array_values(array_unique(array_filter(array_map(fn($v) => is_scalar($v) ? trim((string)$v) : '', $ids), fn($v) => $v !== '')));
++    if (empty($ids)) return [null, 'Pilih minimal satu siswa'];
++    if (count($ids) > 60) return [null, 'Maksimal 60 siswa sekali simpan'];
++
++    $mulai   = $body['tanggal_mulai'] ?? '';
++    $selesai = ($body['tanggal_selesai'] ?? '') ?: $mulai;
++    if (!dispensasiTanggalValid($mulai) || !dispensasiTanggalValid($selesai)) return [null, 'Tanggal tidak valid'];
++    if ($selesai < $mulai) return [null, 'Tanggal selesai tidak boleh sebelum tanggal mulai'];
++    if (count(dispensasiRentangTanggal($mulai, $selesai)) > DISPENSASI_MAKS_HARI) {
++        return [null, 'Rentang dispensasi maksimal ' . DISPENSASI_MAKS_HARI . ' hari'];
++    }
++
++    $jamMulai = $jamSelesai = null;
++    if (empty($body['sehari_penuh'])) {
++        $jm = $body['jam_ke_mulai'] ?? null;
++        $js = ($body['jam_ke_selesai'] ?? null) ?: $jm;
++        if (!is_numeric($jm) || !is_numeric($js)) return [null, 'Isi jam ke- mulai dan selesai, atau pilih sehari penuh'];
++        $jamMulai = (int)$jm;
++        $jamSelesai = (int)$js;
++        if ($jamMulai < 1 || $jamSelesai > DISPENSASI_MAKS_JAM || $jamSelesai < $jamMulai) {
++            return [null, 'Jam ke- harus antara 1 dan ' . DISPENSASI_MAKS_JAM . ', dan jam selesai tidak sebelum jam mulai'];
++        }
++    }
++
++    $kegiatan = trim((string)($body['kegiatan'] ?? ''));
++    if ($kegiatan === '') return [null, 'Nama kegiatan / alasan dispensasi wajib diisi'];
++    if (mb_strlen($kegiatan) > 255) return [null, 'Nama kegiatan maksimal 255 karakter'];
++
++    $nomor = trim((string)($body['nomor_surat'] ?? ''));
++    if (mb_strlen($nomor) > 100) return [null, 'Nomor surat maksimal 100 karakter'];
++
++    $surat = trim((string)($body['surat_path'] ?? ''));
++    if ($surat !== '' && !preg_match('#^uploads/tu/dispensasi/\d{6}/[a-f0-9]{32}\.(pdf|jpg|png)$#', $surat)) {
++        return [null, 'Berkas surat tidak valid'];
++    }
++
++    return [[
++        'student_ids'     => $ids,
++        'tanggal_mulai'   => $mulai,
++        'tanggal_selesai' => $selesai,
++        'jam_ke_mulai'    => $jamMulai,
++        'jam_ke_selesai'  => $jamSelesai,
++        'kegiatan'        => $kegiatan,
++        'nomor_surat'     => $nomor === '' ? null : $nomor,
++        'surat_path'      => $surat === '' ? null : $surat,
++    ], null];
++}
++
++function dispensasiBarisKeluaran(array $r): array
++{
++    $mulai   = $r['jam_ke_mulai'] === null ? null : (int)$r['jam_ke_mulai'];
++    $selesai = $r['jam_ke_selesai'] === null ? null : (int)$r['jam_ke_selesai'];
++    return [
++        'id'                => $r['id'],
++        'student_id'        => $r['student_id'],
++        'student_name'      => $r['student_name'],
++        'class_id'          => $r['class_id'],
++        'class_name'        => $r['class_name'],
++        'tanggal_mulai'     => $r['tanggal_mulai'],
++        'tanggal_selesai'   => $r['tanggal_selesai'],
++        'jam_ke_mulai'      => $mulai,
++        'jam_ke_selesai'    => $selesai,
++        'cakupan'           => dispensasiLabelCakupan($mulai, $selesai),
++        'kegiatan'          => $r['kegiatan'],
++        'nomor_surat'       => $r['nomor_surat'],
++        'surat_path'        => $r['surat_path'],
++        'dicatat_oleh_nama' => $r['dicatat_oleh_nama'],
++        'created_at'        => $r['created_at'],
++    ];
++}
++
++/**
++ * GET ?action=dispensasi_list&dari=Y-m-d&sampai=Y-m-d[&class_id=]
++ */
++function handleDispensasiList(mysqli $db): void
++{
++    dispensasiWajibMetode('GET');
++    $user  = requireAuth();
++    $scope = dispensasiScope($db, $user);
++    if ($scope['mode'] === 'DENY') errorResponse(DISPENSASI_MSG_DENY, 403);
++    dispensasiPastikanTabel($db);
++
++    $dari   = $_GET['dari'] ?? date('Y-m-01');
++    $sampai = $_GET['sampai'] ?? date('Y-m-t');
++    if (!dispensasiTanggalValid($dari) || !dispensasiTanggalValid($sampai)) errorResponse('Tanggal tidak valid');
++    $kelas = trim((string)($_GET['class_id'] ?? ''));
++    if ($kelas !== '' && !classInScope($scope, $kelas)) errorResponse(KESISWAAN_MSG_KELAS, 403);
++
++    $stmt = $db->prepare(
++        "SELECT * FROM student_dispensations WHERE tanggal_mulai <= ? AND tanggal_selesai >= ?
++         ORDER BY tanggal_mulai DESC, class_name, student_name"
++    );
++    $stmt->bind_param("ss", $sampai, $dari);
++    $stmt->execute();
++    $items = [];
++    foreach ($stmt->get_result()->fetch_all(MYSQLI_ASSOC) as $r) {
++        if (!classInScope($scope, $r['class_id']) && !classInScope($scope, $r['class_name'])) continue;
++        if ($kelas !== '' && normalizeClassKey($kelas) !== normalizeClassKey($r['class_id'])
++            && normalizeClassKey($kelas) !== normalizeClassKey($r['class_name'])) continue;
++        $items[] = dispensasiBarisKeluaran($r);
++    }
++    jsonResponse(['scope' => ['mode' => $scope['mode'], 'class_id' => $scope['classId']], 'items' => $items]);
++}
++
++/**
++ * GET ?action=dispensasi_siswa&class_id= — siswa aktif satu kelas dalam cakupan.
++ */
++function handleDispensasiSiswa(mysqli $db): void
++{
++    dispensasiWajibMetode('GET');
++    $user  = requireAuth();
++    $scope = dispensasiScope($db, $user);
++    if ($scope['mode'] === 'DENY') errorResponse(DISPENSASI_MSG_DENY, 403);
++    $kelas = trim((string)($_GET['class_id'] ?? '')) ?: (string)$scope['classId'];
++    if ($kelas === '' || !classInScope($scope, $kelas)) errorResponse(KESISWAAN_MSG_KELAS, 403);
++    $ref = resolveClassRef($db, $kelas);
++
++    $stmt = $db->prepare(
++        "SELECT id, name, nisn FROM students
++         WHERE (class_id = ? OR class_id = ? OR class_name = ?)
++           AND (status IS NULL OR status = '' OR UPPER(status) = 'AKTIF')
++         ORDER BY name"
++    );
++    $stmt->bind_param("sss", $ref['id'], $kelas, $ref['name']);
++    $stmt->execute();
++    jsonResponse(['class' => $ref, 'students' => $stmt->get_result()->fetch_all(MYSQLI_ASSOC)]);
++}
++
++/**
++ * POST ?action=dispensasi_simpan — body lihat dispensasiValidasi. Satu baris per siswa.
++ */
++function handleDispensasiSimpan(mysqli $db): void
++{
++    dispensasiWajibMetode('POST');
++    $user  = requireAuth();
++    $scope = dispensasiScope($db, $user);
++    if ($scope['mode'] === 'DENY') errorResponse(DISPENSASI_MSG_DENY, 403);
++    [$data, $galat] = dispensasiValidasi(getRequestBody());
++    if ($galat !== null) errorResponse($galat);
++    if ($data['surat_path'] !== null && !is_file(dirname(__DIR__) . '/' . $data['surat_path'])) {
++        errorResponse('Berkas surat tidak ditemukan, unggah ulang');
++    }
++    dispensasiPastikanTabel($db);
++
++    // Siswa harus ada dan termasuk cakupan; kelas diambil dari data siswa
++    $ids = $data['student_ids'];
++    $ph  = implode(',', array_fill(0, count($ids), '?'));
++    $stmt = $db->prepare("SELECT id, name, class_id, class_name FROM students WHERE id IN ($ph)");
++    $stmt->bind_param(str_repeat('s', count($ids)), ...$ids);
++    $stmt->execute();
++    $siswa = [];
++    foreach ($stmt->get_result()->fetch_all(MYSQLI_ASSOC) as $s) $siswa[$s['id']] = $s;
++    foreach ($ids as $sid) {
++        if (!isset($siswa[$sid])) errorResponse('Siswa tidak ditemukan: ' . $sid);
++        $s = $siswa[$sid];
++        if (!classInScope($scope, $s['class_id']) && !classInScope($scope, $s['class_name'])) {
++            errorResponse(KESISWAAN_MSG_KELAS, 403);
++        }
++    }
++
++    $db->begin_transaction();
++    try {
++        $stmt = $db->prepare(
++            "INSERT INTO student_dispensations
++                (id, student_id, student_name, class_id, class_name, tanggal_mulai, tanggal_selesai,
++                 jam_ke_mulai, jam_ke_selesai, kegiatan, nomor_surat, surat_path, dicatat_oleh, dicatat_oleh_nama)
++             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
++        );
++        $dibuat = [];
++        foreach ($ids as $sid) {
++            $s  = $siswa[$sid];
++            $id = uniqid('disp_', true);
++            $stmt->bind_param(
++                "sssssssiisssss",
++                $id, $sid, $s['name'], $s['class_id'], $s['class_name'], $data['tanggal_mulai'], $data['tanggal_selesai'],
++                $data['jam_ke_mulai'], $data['jam_ke_selesai'], $data['kegiatan'], $data['nomor_surat'], $data['surat_path'],
++                $user['uid'], $user['displayName']
++            );
++            $stmt->execute();
++            $dibuat[] = $id;
++        }
++        // Presensi harian & insiden dihitung ulang: jam ALFA yang dicakup menjadi DISPENSASI
++        foreach (dispensasiRentangTanggal($data['tanggal_mulai'], $data['tanggal_selesai']) as $tgl) {
++            presensiSinkronHarian($db, $tgl, $ids, $user);
++        }
++        $db->commit();
++    } catch (Throwable $e) {
++        $db->rollback();
++        error_log('[SIMANTAP] dispensasi_simpan: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
++        errorResponse('Gagal menyimpan dispensasi', 500);
++    }
++    jsonResponse(['success' => true, 'ids' => $dibuat]);
++}
++
++/**
++ * POST ?action=dispensasi_hapus — body {id}.
++ */
++function handleDispensasiHapus(mysqli $db): void
++{
++    dispensasiWajibMetode('POST');
++    $user  = requireAuth();
++    $scope = dispensasiScope($db, $user);
++    if ($scope['mode'] === 'DENY') errorResponse(DISPENSASI_MSG_DENY, 403);
++    dispensasiPastikanTabel($db);
++
++    $id = trim((string)(getRequestBody()['id'] ?? ''));
++    $stmt = $db->prepare("SELECT * FROM student_dispensations WHERE id = ?");
++    $stmt->bind_param("s", $id);
++    $stmt->execute();
++    $row = $stmt->get_result()->fetch_assoc();
++    if (!$row) errorResponse('Dispensasi tidak ditemukan', 404);
++    if (!classInScope($scope, $row['class_id']) && !classInScope($scope, $row['class_name'])) {
++        errorResponse(KESISWAAN_MSG_KELAS, 403);
++    }
++
++    $db->begin_transaction();
++    try {
++        $stmt = $db->prepare("DELETE FROM student_dispensations WHERE id = ?");
++        $stmt->bind_param("s", $id);
++        $stmt->execute();
++        foreach (dispensasiRentangTanggal($row['tanggal_mulai'], $row['tanggal_selesai']) as $tgl) {
++            presensiSinkronHarian($db, $tgl, [$row['student_id']], $user);
++        }
++        $db->commit();
++    } catch (Throwable $e) {
++        $db->rollback();
++        error_log('[SIMANTAP] dispensasi_hapus: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
++        errorResponse('Gagal menghapus dispensasi', 500);
++    }
++
++    // Berkas surat dihapus bila tidak dipakai dispensasi lain (satu surat untuk banyak siswa)
++    if (!empty($row['surat_path'])) {
++        $stmt = $db->prepare("SELECT COUNT(*) AS c FROM student_dispensations WHERE surat_path = ?");
++        $stmt->bind_param("s", $row['surat_path']);
++        $stmt->execute();
++        $sisa = (int)$stmt->get_result()->fetch_assoc()['c'];
++        $berkas = dirname(__DIR__) . '/' . $row['surat_path'];
++        if ($sisa === 0 && preg_match('#^uploads/tu/dispensasi/\d{6}/[a-f0-9]{32}\.(pdf|jpg|png)$#', $row['surat_path']) && is_file($berkas)) {
++            @unlink($berkas);
++        }
++    }
++    jsonResponse(['success' => true]);
++}
++
++/**
++ * POST multipart ?action=dispensasi_unggah_surat — field "file" (PDF/JPG/PNG, maks 5 MB).
++ * Ekstensi ditentukan dari isi berkas, bukan dari nama berkas klien.
++ */
++function handleDispensasiUnggahSurat(mysqli $db): void
++{
++    dispensasiWajibMetode('POST');
++    $user  = requireAuth();
++    $scope = dispensasiScope($db, $user);
++    if ($scope['mode'] === 'DENY') errorResponse(DISPENSASI_MSG_DENY, 403);
++
++    $f = $_FILES['file'] ?? null;
++    if (!$f || !is_array($f) || ($f['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK || !is_uploaded_file($f['tmp_name'])) {
++        errorResponse('Berkas surat gagal diunggah');
++    }
++    if ((int)$f['size'] > DISPENSASI_MAKS_UNGGAH) errorResponse('Ukuran berkas maksimal 5 MB');
++    $mime = (new finfo(FILEINFO_MIME_TYPE))->file($f['tmp_name']);
++    $ext  = DISPENSASI_MIME[$mime] ?? null;
++    if ($ext === null) errorResponse('Surat harus berupa PDF, JPG, atau PNG');
++
++    $sub = 'uploads/tu/dispensasi/' . date('Ym');
++    $dir = dirname(__DIR__) . '/' . $sub;
++    if (!is_dir($dir) && !mkdir($dir, 0755, true)) errorResponse('Folder unggahan tidak dapat dibuat', 500);
++    foreach ([dirname($dir), $dir] as $d) {
++        if (!is_file("$d/index.html")) @file_put_contents("$d/index.html", '');
++    }
++    $nama = bin2hex(random_bytes(16)) . '.' . $ext;
++    if (!move_uploaded_file($f['tmp_name'], "$dir/$nama")) errorResponse('Berkas surat gagal disimpan', 500);
++    jsonResponse(['success' => true, 'path' => "$sub/$nama"]);
++}
++
++/**
++ * GET ?action=dispensasi_jurnal&class_id=&date=Y-m-d&jam=1-2
++ * Dispensasi yang mencakup jam jurnal ini, untuk mengisi status D di form jurnal.
++ * Terbuka untuk semua pengguna yang login (guru mapel mana pun mengisi jurnal).
++ * Hasil: {items: {student_id: {kegiatan, cakupan}}}
++ */
++function handleDispensasiJurnal(mysqli $db): void
++{
++    dispensasiWajibMetode('GET');
++    requireAuth();
++    $kelas = trim((string)($_GET['class_id'] ?? ''));
++    $date  = (string)($_GET['date'] ?? '');
++    if ($kelas === '' || !dispensasiTanggalValid($date)) jsonResponse(['items' => new stdClass()]);
++
++    $items = [];
++    foreach (presensiDispensasiTanggal($db, $date) as $sid => $daftar) {
++        foreach ($daftar as $d) {
++            if (normalizeClassKey($d['class_id']) !== normalizeClassKey($kelas)
++                && normalizeClassKey($d['class_name']) !== normalizeClassKey($kelas)) continue;
++            if (!presensiDispensasiMencakup($d, presensiAngkaJam((string)($_GET['jam'] ?? '')))) continue;
++            $items[$sid] = [
++                'kegiatan' => $d['kegiatan'],
++                'cakupan'  => dispensasiLabelCakupan($d['jam_ke_mulai'], $d['jam_ke_selesai']),
++            ];
++            break;
++        }
++    }
++    jsonResponse(['items' => $items ?: new stdClass()]);
++}
+diff --git a/api/index.php b/api/index.php
+index bb80bee..de19245 100644
+--- a/api/index.php
++++ b/api/index.php
+@@ -41,6 +41,7 @@ require_once __DIR__ . '/teacher_subject_access.php';
+ require_once __DIR__ . '/rekap_bulanan.php';
+ require_once __DIR__ . '/pantau_nilai.php';
+ require_once __DIR__ . '/presensi_harian.php';
++require_once __DIR__ . '/dispensasi.php';
+ require_once __DIR__ . '/portal_nilai.php';
+ require_once __DIR__ . '/persetujuan_jurnal.php';
+ 
+@@ -568,13 +569,13 @@ switch ($action) {
+             // termasuk siswa/tanggal lama bila jurnal diedit (lihat presensi_harian.php).
+             $sinkron = [];
+             if (!$isDraft) {
+-                $sinkron[$date] = array_keys(pantauNilaiParseAttendance($studentAttendance));
++                $sinkron[$date] = array_keys(presensiParseJurnal($studentAttendance));
+             }
+             if ($existing && !(int)$existing['isDraft']) {
+                 $oldDate = (string)$existing['date'];
+                 $sinkron[$oldDate] = array_merge(
+                     $sinkron[$oldDate] ?? [],
+-                    array_keys(pantauNilaiParseAttendance($existing['studentAttendance']))
++                    array_keys(presensiParseJurnal($existing['studentAttendance']))
+                 );
+             }
+             foreach ($sinkron as $tgl => $ids) {
+@@ -622,7 +623,7 @@ switch ($action) {
+             // Presensi harian siswa di jurnal ini dihitung ulang tanpa jurnal yang dihapus
+             if ($jurnalLama && !(int)$jurnalLama['isDraft']) {
+                 presensiSinkronHarian($db, (string)$jurnalLama['date'],
+-                    array_keys(pantauNilaiParseAttendance($jurnalLama['studentAttendance'])), $user);
++                    array_keys(presensiParseJurnal($jurnalLama['studentAttendance'])), $user);
+             }
+             $db->commit();
+         } catch (Throwable $e) {
+@@ -2316,6 +2317,31 @@ switch ($action) {
+         handlePortalNilaiSetAktif($db);
+         break;
+ 
++    // --- DISPENSASI SISWA (docs/patches/dispensasi-siswa.md) ---
++    case 'dispensasi_list':
++        handleDispensasiList($db);
++        break;
++
++    case 'dispensasi_siswa':
++        handleDispensasiSiswa($db);
++        break;
++
++    case 'dispensasi_simpan':
++        handleDispensasiSimpan($db);
++        break;
++
++    case 'dispensasi_hapus':
++        handleDispensasiHapus($db);
++        break;
++
++    case 'dispensasi_unggah_surat':
++        handleDispensasiUnggahSurat($db);
++        break;
++
++    case 'dispensasi_jurnal':
++        handleDispensasiJurnal($db);
++        break;
++
+     default:
+ 
+         $handled = require __DIR__ . '/endpoints_v2.php';
+diff --git a/api/presensi_harian.php b/api/presensi_harian.php
+index d0124f7..a122004 100644
+--- a/api/presensi_harian.php
++++ b/api/presensi_harian.php
+@@ -6,41 +6,161 @@
+  * presensi per jam pelajaran. Status harian dihitung ulang dari SEMUA jurnal non-draf
+  * pada tanggal itu, bukan ditimpa oleh jurnal yang terakhir disimpan:
+  *   1. baris MANUAL (disimpan wali kelas) tidak pernah diubah;
+- *   2. ada minimal satu jam HADIR            -> HADIR;
++ *   2. ada minimal satu jam HADIR/DISPENSASI -> HADIR;
+  *   3. tidak ada HADIR, ada SAKIT            -> SAKIT;
+  *   4. tidak ada HADIR/SAKIT, ada IZIN       -> IZIN;
+  *   5. seluruh jam ALFA                      -> ALFA.
+  * Jam yang tidak diikuti dicatat di kolom notes agar wali kelas tetap melihatnya.
+  *
++ * Dispensasi (tabel student_dispensations, lihat dispensasi.php): jam ALFA yang dicakup
++ * dispensasi dihitung sebagai DISPENSASI, sehingga tidak memicu insiden. Isi jurnal tidak diubah.
++ *
+  * Insiden otomatis selalu mengikuti status harian FINAL, termasuk status MANUAL,
+  * dan masing-masing paling banyak satu per siswa per hari:
+  *   - ALFA       (id inc_att_<siswa>_<tanggal>): final ALFA;
+  *   - TINGGAL_JP (id inc_tjp_<siswa>_<tanggal>): final HADIR tetapi minimal satu jam
+- *     pelajaran ALFA di jurnal (meninggalkan jam pelajaran tanpa izin).
++ *     pelajaran ALFA di jurnal yang tidak dicakup dispensasi (meninggalkan jam pelajaran
++ *     tanpa izin).
+  * Insiden yang syaratnya tidak lagi terpenuhi dihapus dan poinnya dikembalikan.
+  *
+- * Parser presensi jurnal (pantauNilaiParseAttendance/pantauNilaiAttendanceStatus)
+- * berasal dari api/pantau_nilai.php.
+  */
+ if (!defined('SIMANTAP_API')) exit;
+ 
++/**
++ * Normalisasi status presensi per jam dari jurnal. ALPHA/ALPA -> ALFA, D -> DISPENSASI,
++ * status asing -> null. Berbeda dari pantauNilaiAttendanceStatus yang tidak mengenal DISPENSASI.
++ */
++function presensiStatusJam($status): ?string
++{
++    if (!is_scalar($status)) return null;
++    $s = strtoupper(trim((string)$status));
++    if ($s === 'ALPHA' || $s === 'ALPA') $s = 'ALFA';
++    if ($s === 'D' || $s === 'DISPEN') $s = 'DISPENSASI';
++    return in_array($s, ['HADIR', 'SAKIT', 'IZIN', 'ALFA', 'DISPENSASI'], true) ? $s : null;
++}
++
++/**
++ * Isi journal_entries.studentAttendance -> [student_id => status presensiStatusJam].
++ * Mendukung map {"<student_id>": "HADIR"} dan array [{studentId|student_id, status}].
++ */
++function presensiParseJurnal(?string $json): array
++{
++    $data = json_decode((string)$json, true);
++    if (!is_array($data)) return [];
++    $map = [];
++    if (array_is_list($data)) {
++        foreach ($data as $row) {
++            if (!is_array($row)) continue;
++            $sid = $row['studentId'] ?? $row['student_id'] ?? $row['id'] ?? '';
++            if (!is_scalar($sid) || (string)$sid === '') continue;
++            $st = presensiStatusJam($row['status'] ?? null);
++            if ($st !== null) $map[(string)$sid] = $st;
++        }
++    } else {
++        foreach ($data as $sid => $status) {
++            if (is_array($status)) $status = $status['status'] ?? null;
++            $st = presensiStatusJam($status);
++            if ($st !== null) $map[(string)$sid] = $st;
++        }
++    }
++    return $map;
++}
++
++/**
++ * Angka jam pelajaran dari kolom "Jam Ke-" jurnal (teks bebas), mis. "1-2" -> [1, 2],
++ * "3" -> [3], "1, 3" -> [1, 3], "3 s.d. 5" -> [3, 4, 5]. Teks tanpa angka -> [].
++ */
++function presensiAngkaJam(string $jamKe): array
++{
++    $t = strtolower($jamKe);
++    $t = str_replace(['s.d.', 's.d', 's/d', 'sd', 'sampai', "\u{2013}", "\u{2014}"], '-', $t);
++    $angka = [];
++    if (preg_match_all('/(\d{1,2})\s*-+\s*(\d{1,2})/', $t, $m, PREG_SET_ORDER)) {
++        foreach ($m as $r) {
++            [$a, $b] = [(int)$r[1], (int)$r[2]];
++            if ($a > $b) [$a, $b] = [$b, $a];
++            for ($i = $a; $i <= min($b, $a + 20); $i++) $angka[$i] = true;
++        }
++        $t = preg_replace('/(\d{1,2})\s*-+\s*(\d{1,2})/', ' ', $t);
++    }
++    if (preg_match_all('/\d{1,2}/', $t, $m)) {
++        foreach ($m[0] as $n) $angka[(int)$n] = true;
++    }
++    $out = array_keys($angka);
++    sort($out);
++    return $out;
++}
++
++/**
++ * Apakah dispensasi ($d: jam_ke_mulai, jam_ke_selesai; null = sehari penuh) mencakup
++ * salah satu jam pelajaran. Jam jurnal yang tidak terbaca hanya dicakup dispensasi sehari penuh.
++ */
++function presensiDispensasiMencakup(array $d, array $angkaJam): bool
++{
++    if ($d['jam_ke_mulai'] === null) return true;
++    foreach ($angkaJam as $n) {
++        if ($n >= $d['jam_ke_mulai'] && $n <= $d['jam_ke_selesai']) return true;
++    }
++    return false;
++}
++
++/**
++ * Dispensasi yang berlaku pada tanggal itu: [student_id => list baris]. Tabel yang belum ada
++ * (fitur belum pernah dipakai) dianggap kosong; tidak ada DDL di sini karena bisa berjalan
++ * di dalam transaksi.
++ */
++function presensiDispensasiTanggal(mysqli $db, string $date, ?array $studentIds = null): array
++{
++    static $adaTabel = null;
++    if ($adaTabel !== true) {
++        $res = $db->query("SHOW TABLES LIKE 'student_dispensations'");
++        $adaTabel = $res && $res->num_rows > 0;
++        if (!$adaTabel) return [];
++    }
++    $sql = "SELECT student_id, class_id, class_name, jam_ke_mulai, jam_ke_selesai, kegiatan
++            FROM student_dispensations WHERE tanggal_mulai <= ? AND tanggal_selesai >= ?";
++    $types = 'ss';
++    $params = [$date, $date];
++    if ($studentIds !== null) {
++        if (empty($studentIds)) return [];
++        $sql .= ' AND student_id IN (' . implode(',', array_fill(0, count($studentIds), '?')) . ')';
++        $types .= str_repeat('s', count($studentIds));
++        array_push($params, ...$studentIds);
++    }
++    $stmt = $db->prepare($sql . ' ORDER BY created_at');
++    $stmt->bind_param($types, ...$params);
++    $stmt->execute();
++    $out = [];
++    foreach ($stmt->get_result()->fetch_all(MYSQLI_ASSOC) as $r) {
++        $r['jam_ke_mulai']   = $r['jam_ke_mulai'] === null ? null : (int)$r['jam_ke_mulai'];
++        $r['jam_ke_selesai'] = $r['jam_ke_selesai'] === null ? null : (int)$r['jam_ke_selesai'];
++        $out[$r['student_id']][] = $r;
++    }
++    return $out;
++}
++
+ /**
+  * Turunkan status harian dari daftar presensi per jam (fungsi murni).
+- * $jam: list ['status' => ..., 'label' => 'jam 3 (Matematika)'] berurutan menurut jam.
++ * $jam: list ['status' => ..., 'label' => 'jam 3 (Matematika)', 'keterangan' => ?string]
++ *       berurutan menurut jam. DISPENSASI dihitung hadir.
+  * Hasil: ['status' => ..., 'notes' => string|null], atau null bila daftar kosong.
+  */
+ function presensiTurunkanHarian(array $jam): ?array
+ {
+     $statuses = [];
+     foreach ($jam as $j) {
+-        $st = pantauNilaiAttendanceStatus($j['status'] ?? null);
++        $st = presensiStatusJam($j['status'] ?? null);
+         if ($st !== null) $statuses[] = $st;
+     }
+     if (empty($statuses)) return null;
+ 
+     $status = 'ALFA';
+-    foreach (['HADIR', 'SAKIT', 'IZIN'] as $prioritas) {
+-        if (in_array($prioritas, $statuses, true)) { $status = $prioritas; break; }
++    if (in_array('HADIR', $statuses, true) || in_array('DISPENSASI', $statuses, true)) {
++        $status = 'HADIR';
++    } else {
++        foreach (['SAKIT', 'IZIN'] as $prioritas) {
++            if (in_array($prioritas, $statuses, true)) { $status = $prioritas; break; }
++        }
+     }
+ 
+     // Catatan hanya bila status per jam tidak seragam
+@@ -48,9 +168,10 @@ function presensiTurunkanHarian(array $jam): ?array
+     if (count(array_unique($statuses)) > 1) {
+         $bagian = [];
+         foreach ($jam as $j) {
+-            $st = pantauNilaiAttendanceStatus($j['status'] ?? null);
++            $st = presensiStatusJam($j['status'] ?? null);
+             if ($st === null || $st === 'HADIR') continue;
+-            $bagian[] = trim((string)($j['label'] ?? '')) . ': ' . $st;
++            $ket = trim((string)($j['keterangan'] ?? ''));
++            $bagian[] = trim((string)($j['label'] ?? '')) . ': ' . $st . ($ket !== '' ? " ($ket)" : '');
+         }
+         $notes = 'Dari jurnal, tidak mengikuti ' . implode('; ', $bagian);
+     }
+@@ -64,7 +185,7 @@ function presensiJamAlfa(array $jam): array
+ {
+     $label = [];
+     foreach ($jam as $j) {
+-        if (pantauNilaiAttendanceStatus($j['status'] ?? null) === 'ALFA') {
++        if (presensiStatusJam($j['status'] ?? null) === 'ALFA') {
+             $label[] = trim((string)($j['label'] ?? ''));
+         }
+     }
+@@ -232,15 +353,28 @@ function presensiSinkronHarian(mysqli $db, string $date, array $studentIds, arra
+     usort($jurnal, fn($a, $b) =>
+         [(int)$a['jam_ke'], (string)$a['period']] <=> [(int)$b['jam_ke'], (string)$b['period']]);
+ 
++    $dispensasi = presensiDispensasiTanggal($db, $date, $studentIds);
++
+     $jamPerSiswa = [];
+     $kelasJurnal = [];
+     foreach ($jurnal as $j) {
+         $jamKe = trim((string)($j['jam_ke'] ?? ''));
++        $angkaJam = presensiAngkaJam($jamKe);
+         $label = ($jamKe !== '' ? 'jam ' . $jamKe : trim((string)$j['period']))
+             . (trim((string)$j['subjectName']) !== '' ? ' (' . trim((string)$j['subjectName']) . ')' : '');
+-        foreach (pantauNilaiParseAttendance($j['studentAttendance']) as $sid => $status) {
++        foreach (presensiParseJurnal($j['studentAttendance']) as $sid => $status) {
+             if (!isset($target[$sid])) continue;
+-            $jamPerSiswa[$sid][] = ['status' => $status, 'label' => trim($label)];
++            // Dispensasi yang mencakup jam ini: ALFA dianggap DISPENSASI (dispensasi susulan menang)
++            $keterangan = null;
++            if ($status === 'ALFA' || $status === 'DISPENSASI') {
++                foreach ($dispensasi[$sid] ?? [] as $d) {
++                    if (!presensiDispensasiMencakup($d, $angkaJam)) continue;
++                    $status = 'DISPENSASI';
++                    $keterangan = $d['kegiatan'];
++                    break;
++                }
++            }
++            $jamPerSiswa[$sid][] = ['status' => $status, 'label' => trim($label), 'keterangan' => $keterangan];
+             $kelasJurnal[$sid] = ['class_id' => $j['classId'], 'class_name' => $j['className']];
+         }
+     }

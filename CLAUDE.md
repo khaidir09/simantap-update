@@ -44,6 +44,7 @@ The files are split by development phase, not by domain:
 | `api/endpoints_v3.php` | homeroom dashboards, extracurricular members/activities, `save_user_v2`, classes |
 | `api/endpoints_tu.php` | staff (GTK), students (TU version), file upload/delete, letters, legalization, inventory, rooms/bookings, archive, staff attendance |
 | `api/dispensasi.php` | student dispensations (`dispensasi_*` actions, dispatched by explicit `case`s in `index.php`); table `student_dispensations` is created on first use. See `docs/patches/dispensasi-siswa.md` |
+| `api/presensi_jam_sebelumnya.php` | `presensi_jam_sebelumnya` (explicit `case` in `index.php`): SAKIT/IZIN from the latest earlier non-draft journal of the same class/date (or MANUAL homeroom attendance) that the journal form pre-fills for new journals; ALFA isn't carried over. See `docs/patches/presensi-jam-sebelumnya.md` |
 | `api/jadwal_kbm.php` | teacher KBM schedules in `gtk_pegawai.jadwal_mengajar_json` (`jadwal_kbm_get`/`jadwal_kbm_save`, explicit `case`s in `index.php`): teachers edit their own from Profil, TU/ADMIN edit anyone's; saves require the `versi` hash (409 on conflict); old free-text `jamKe` entries are parsed on read. The journal form auto-fills Jam Ke-/Jam Mulai/Jam Selesai from it. See `docs/specs/jadwal-kbm-mandiri-guru.md` |
 
 Several parallel legacy/current endpoint pairs exist and the bundle uses both sides:

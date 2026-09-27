@@ -43,6 +43,7 @@ require_once __DIR__ . '/rekap_bulanan.php';
 require_once __DIR__ . '/pantau_nilai.php';
 require_once __DIR__ . '/presensi_harian.php';
 require_once __DIR__ . '/dispensasi.php';
+require_once __DIR__ . '/presensi_jam_sebelumnya.php';
 require_once __DIR__ . '/portal_nilai.php';
 require_once __DIR__ . '/persetujuan_jurnal.php';
 
@@ -2341,6 +2342,11 @@ switch ($action) {
 
     case 'dispensasi_jurnal':
         handleDispensasiJurnal($db);
+        break;
+
+    // --- PRESENSI JAM SEBELUMNYA DI FORM JURNAL (docs/patches/presensi-jam-sebelumnya.md) ---
+    case 'presensi_jam_sebelumnya':
+        handlePresensiJamSebelumnya($db);
         break;
 
     // --- JADWAL KBM (docs/specs/jadwal-kbm-mandiri-guru.md) ---

@@ -47,6 +47,7 @@ require_once __DIR__ . '/presensi_jam_sebelumnya.php';
 require_once __DIR__ . '/label_media.php';
 require_once __DIR__ . '/portal_nilai.php';
 require_once __DIR__ . '/persetujuan_jurnal.php';
+require_once __DIR__ . '/kelola_guru.php';
 
 $action = $_GET['action'] ?? '';
 
@@ -103,6 +104,9 @@ switch ($action) {
             $user['class_homeroom_name'] = !empty($user['class_homeroom']) ? resolveClassRef($db, $user['class_homeroom'])['name'] : '';
             // Penanda menu Ekstrakurikuler (pembina / wali kelas terkait)
             $user = array_merge($user, ekskulMenuCounts($db, $user));
+
+            // Waktu login terakhir untuk kolom keaktifan di Kelola Guru (gagal tidak menggagalkan login)
+            kgCatatLogin($db, (string)$user['uid']);
 
             $_SESSION['user'] = $user;
             jsonResponse(['user' => $user]);
@@ -209,7 +213,8 @@ switch ($action) {
             $row['is_bk'] = (int)($row['is_bk'] ?? 0);
             $users[] = $row;
         }
-        jsonResponse($users);
+        // Field tambahan Kelola Guru: mapel_count, jadwal_count, last_login_at, last_login_hari
+        jsonResponse(kgStatusGuru($db, $users));
         break;
 
     case 'save_user':
@@ -228,6 +233,9 @@ switch ($action) {
         if (empty($uid) || empty($email) || empty($displayName)) {
             errorResponse('UID, email, dan displayName wajib diisi');
         }
+
+        // Format, hak ubah email (khusus ADMIN), dan duplikat dicek sebelum menulis apa pun
+        $emailLama = kgValidasiEmail($db, $uid, $email);
 
         $hashed = !empty($password) ? password_hash($password, PASSWORD_BCRYPT) : null;
 
@@ -252,6 +260,9 @@ switch ($action) {
         }
 
         if ($stmt->execute()) {
+            $emailBerubah = $emailLama !== null && $emailLama !== $email;
+            // Pindahkan baris teacher_registry email lama & perbarui sesi bila akun sendiri
+            if ($emailBerubah) kgSetelahEmailBerubah($db, $uid, $emailLama, $email);
             // Synchronize with teacher_registry
             if ($role === 'GURU') {
                 $regStmt = $db->prepare("REPLACE INTO teacher_registry (email, fullName, nip, schoolName) VALUES (?, ?, ?, ?)");
@@ -270,7 +281,7 @@ switch ($action) {
                 $_SESSION['user']['class_homeroom'] = $classHomeroom;
                 $_SESSION['user']['is_bk'] = $isBk;
             }
-            jsonResponse(['success' => true]);
+            jsonResponse(['success' => true, 'email_berubah' => $emailBerubah]);
         } else {
             errorResponse('Gagal menyimpan user: ' . $db->error);
         }

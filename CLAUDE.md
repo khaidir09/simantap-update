@@ -47,6 +47,7 @@ The files are split by development phase, not by domain:
 | `api/presensi_jam_sebelumnya.php` | `presensi_jam_sebelumnya` (explicit `case` in `index.php`): SAKIT/IZIN from the latest earlier non-draft journal of the same class/date (or MANUAL homeroom attendance) that the journal form pre-fills for new journals; ALFA isn't carried over. See `docs/patches/presensi-jam-sebelumnya.md` |
 | `api/label_media.php` | journal-form "Media / Alat Pembelajaran" labels (`media_label_list`/`media_label_simpan`/`media_label_hapus`, explicit `case`s in `index.php`): built-in labels + each teacher's typed labels and past `alat_media` values; table `journal_media_labels` is created on first use; the journal still stores comma-separated text. See `docs/patches/label-media-jurnal.md` |
 | `api/jadwal_kbm.php` | teacher KBM schedules in `gtk_pegawai.jadwal_mengajar_json` (`jadwal_kbm_get`/`jadwal_kbm_save`, explicit `case`s in `index.php`): teachers edit their own from Profil, TU/ADMIN edit anyone's; saves require the `versi` hash (409 on conflict); old free-text `jamKe` entries are parsed on read. The journal form auto-fills Jam Ke-/Jam Mulai/Jam Selesai from it. See `docs/specs/jadwal-kbm-mandiri-guru.md` |
+| `api/kelola_guru.php` | helpers for the Kelola Guru page (no actions of its own): `kgCatatLogin` writes `users.last_login_at` on login (column created on first use; the old `lastLogin` has `ON UPDATE` and isn't a login time); `kgStatusGuru` adds `mapel_count`/`jadwal_count`/`last_login_at`/`last_login_hari` to `get_users`; `kgValidasiEmail` guards `save_user`/`save_user_v2` (email change ADMIN-only, 409 on duplicate, 400 on bad format). `gtk_update` can still change `users.email` without this guard. See `docs/specs/kelola-guru-tabel-modal.md` |
 
 Several parallel legacy/current endpoint pairs exist and the bundle uses both sides:
 - users: `save_user` vs `save_user_v2`;
@@ -120,7 +121,7 @@ Known data bugs and hardcoded values:
 - `tu_file_delete` with `module=siswa` queries a nonexistent `siswa` table.
 - `'SMAN 1 BANJARBARU'` and `'2025/2026'` are hardcoded as defaults in several places.
 - `verify_ekskul_journal` is a no-op.
-- `users.lastLogin` changes on every row update, not just on login.
+- `users.lastLogin` changes on every row update, not just on login. Use `users.last_login_at` (see `api/kelola_guru.php`).
 
 ## Uploads
 

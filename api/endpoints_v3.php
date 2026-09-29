@@ -435,6 +435,9 @@ switch ($action) {
 
         if (empty($uid) || empty($email) || empty($displayName)) errorResponse('UID, email, dan nama wajib diisi');
 
+        // Format, hak ubah email (khusus ADMIN), dan duplikat dicek sebelum menulis apa pun
+        $emailLama = kgValidasiEmail($db, $uid, $email);
+
         $hashed = !empty($password) ? password_hash($password, PASSWORD_BCRYPT) : null;
 
         $stmtCheck = $db->prepare("SELECT uid FROM users WHERE uid = ?");
@@ -457,6 +460,9 @@ switch ($action) {
         }
 
         if ($stmt->execute()) {
+            $emailBerubah = $emailLama !== null && $emailLama !== $email;
+            // Pindahkan baris teacher_registry email lama & perbarui email di sesi bila akun sendiri
+            if ($emailBerubah) kgSetelahEmailBerubah($db, $uid, $emailLama, $email);
             // Update session jika yang diubah adalah diri sendiri
             if (isset($_SESSION['user']) && $_SESSION['user']['uid'] === $uid) {
                 $_SESSION['user']['class_homeroom'] = $classHomeroom;
@@ -543,7 +549,7 @@ switch ($action) {
                 }
             }
 
-            jsonResponse(['success' => true]);
+            jsonResponse(['success' => true, 'email_berubah' => $emailBerubah]);
         } else {
             errorResponse('Gagal menyimpan: ' . $db->error);
         }

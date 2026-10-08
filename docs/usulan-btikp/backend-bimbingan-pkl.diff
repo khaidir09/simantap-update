@@ -1,0 +1,1768 @@
+diff --git a/api/bimbingan_pkl.php b/api/bimbingan_pkl.php
+new file mode 100644
+index 0000000..df04169
+--- /dev/null
++++ b/api/bimbingan_pkl.php
+@@ -0,0 +1,1678 @@
++<?php
++/**
++ * Jurnal Bimbingan PKL: guru membimbing siswa kelas XII yang sedang Praktik Kerja Lapangan.
++ * Spesifikasi: docs/specs/jurnal-bimbingan-pkl.md
++ *
++ * - pkl_dudi       : master tempat PKL (DU/DI).
++ * - pkl_penempatan : siswa ↔ DU/DI ↔ guru pembimbing ↔ periode. Periode satu siswa tidak boleh
++ *                    tumpang tindih, sehingga satu siswa hanya punya satu pembimbing per tanggal.
++ * - pkl_jurnal     : satu kegiatan bimbingan untuk satu penempatan pada satu tanggal.
++ * - Tidak menyentuh presensi harian, insiden, poin, panggilan orang tua, atau journal_entries.
++ * - Pembimbing hanya GURU dengan penugasan mapel kelas XII (teacher_subjects).
++ *
++ * Hanya boleh dimuat lewat api/index.php.
++ */
++if (!defined('SIMANTAP_API')) exit;
++
++const PKL_MSG_DENY       = 'Anda tidak memiliki akses ke Bimbingan PKL.';
++const PKL_MSG_SYARAT     = 'Hanya guru dengan penugasan mapel kelas XII yang dapat menjadi pembimbing PKL. Lengkapi penugasan mapel di Profil bila Anda mengajar kelas XII.';
++const PKL_JENIS          = ['KUNJUNGAN' => 'Kunjungan/Monitoring DU/DI', 'DARING' => 'Bimbingan Daring', 'SEKOLAH' => 'Bimbingan di Sekolah'];
++const PKL_JENIS_PENDEK   = ['KUNJUNGAN' => 'Kunjungan', 'DARING' => 'Daring', 'SEKOLAH' => 'Di Sekolah'];
++const PKL_MAKS_HARI      = 366;
++const PKL_MAKS_FOTO      = 3;
++const PKL_MAKS_UNGGAH    = 2 * 1024 * 1024;
++const PKL_MIME_FOTO      = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp'];
++const PKL_POLA_FOTO      = '#^uploads/journals/pkl/\d{6}/[a-f0-9]{32}\.(jpg|png|webp)$#';
++const PKL_SISWA_AKTIF    = "(s.status IS NULL OR s.status = '' OR UPPER(s.status) = 'AKTIF')";
++
++// ---------------------------------------------------------------------------
++// Tabel
++// ---------------------------------------------------------------------------
++
++/**
++ * Buat tabel bila belum ada (sekali per request). DDL memicu implicit commit,
++ * jadi jangan dipanggil di dalam transaksi.
++ */
++function pklPastikanTabel(mysqli $db): void
++{
++    static $sudah = false;
++    if ($sudah) return;
++    $db->query("CREATE TABLE IF NOT EXISTS `pkl_dudi` (
++        `id` varchar(64) NOT NULL,
++        `nama` varchar(255) NOT NULL,
++        `nama_norm` varchar(255) NOT NULL,
++        `bidang_usaha` varchar(150) DEFAULT NULL,
++        `alamat` text DEFAULT NULL,
++        `pembimbing_nama` varchar(150) DEFAULT NULL COMMENT 'pembimbing industri',
++        `pembimbing_telp` varchar(30) DEFAULT NULL,
++        `catatan` text DEFAULT NULL,
++        `dibuat_oleh` varchar(128) NOT NULL,
++        `dibuat_pada` datetime NOT NULL,
++        `diubah_pada` datetime DEFAULT NULL,
++        PRIMARY KEY (`id`),
++        UNIQUE KEY `uq_pkl_dudi_norm` (`nama_norm`)
++    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
++    $db->query("CREATE TABLE IF NOT EXISTS `pkl_penempatan` (
++        `id` varchar(64) NOT NULL,
++        `siswa_id` varchar(128) NOT NULL,
++        `siswa_nama` varchar(255) NOT NULL,
++        `kelas_id` varchar(50) NOT NULL,
++        `kelas_nama` varchar(100) NOT NULL,
++        `dudi_id` varchar(64) NOT NULL,
++        `guru_id` varchar(128) NOT NULL,
++        `guru_nama` varchar(255) NOT NULL,
++        `tanggal_mulai` date NOT NULL,
++        `tanggal_selesai` date NOT NULL,
++        `tahun_ajaran` varchar(20) NOT NULL,
++        `dibuat_oleh` varchar(128) NOT NULL,
++        `dibuat_pada` datetime NOT NULL,
++        `diubah_oleh` varchar(128) DEFAULT NULL,
++        `diubah_pada` datetime DEFAULT NULL,
++        PRIMARY KEY (`id`),
++        KEY `idx_pklp_siswa` (`siswa_id`, `tanggal_mulai`),
++        KEY `idx_pklp_guru` (`guru_id`, `tanggal_mulai`),
++        KEY `idx_pklp_kelas` (`kelas_id`),
++        KEY `idx_pklp_dudi` (`dudi_id`)
++    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
++    $db->query("CREATE TABLE IF NOT EXISTS `pkl_jurnal` (
++        `id` varchar(64) NOT NULL,
++        `penempatan_id` varchar(64) NOT NULL,
++        `guru_id` varchar(128) NOT NULL,
++        `guru_nama` varchar(255) NOT NULL,
++        `siswa_id` varchar(128) NOT NULL,
++        `tanggal` date NOT NULL,
++        `jam_mulai` char(5) NOT NULL,
++        `jam_selesai` char(5) NOT NULL,
++        `jenis` varchar(20) NOT NULL COMMENT 'KUNJUNGAN | DARING | SEKOLAH',
++        `uraian` text NOT NULL,
++        `kondisi_siswa` text DEFAULT NULL,
++        `permasalahan` text DEFAULT NULL,
++        `tindak_lanjut` text DEFAULT NULL,
++        `foto_json` text DEFAULT NULL,
++        `dibuat_pada` datetime NOT NULL,
++        `diubah_pada` datetime DEFAULT NULL,
++        PRIMARY KEY (`id`),
++        KEY `idx_pklj_guru_tgl` (`guru_id`, `tanggal`),
++        KEY `idx_pklj_penempatan` (`penempatan_id`, `tanggal`),
++        KEY `idx_pklj_siswa` (`siswa_id`, `tanggal`)
++    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
++    $sudah = true;
++}
++
++// ---------------------------------------------------------------------------
++// Helper umum
++// ---------------------------------------------------------------------------
++
++function pklWajibMetode(string $metode): void
++{
++    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== $metode) {
++        header('Allow: ' . $metode);
++        errorResponse('Metode tidak diizinkan', 405);
++    }
++}
++
++function pklHariIni(): string
++{
++    return date('Y-m-d');
++}
++
++function pklSekarang(): string
++{
++    return date('Y-m-d H:i:s');
++}
++
++function pklTanggalValid($tgl): bool
++{
++    if (!is_string($tgl) || !preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', $tgl, $m)) return false;
++    return checkdate((int)$m[2], (int)$m[3], (int)$m[1]);
++}
++
++function pklTglPendek(?string $ymd): string
++{
++    $p = explode('-', substr((string)$ymd, 0, 10));
++    return count($p) === 3 ? "$p[2]/$p[1]/$p[0]" : '-';
++}
++
++function pklTambahHari(string $ymd, int $hari): string
++{
++    return (new DateTimeImmutable($ymd))->modify(($hari >= 0 ? '+' : '') . $hari . ' day')->format('Y-m-d');
++}
++
++function pklTeks(array $body, string $kunci, int $maks, string $label, bool $wajib = false): ?string
++{
++    $v = $body[$kunci] ?? '';
++    $v = is_scalar($v) ? trim((string)$v) : '';
++    if ($v === '') {
++        if ($wajib) errorResponse("$label wajib diisi");
++        return null;
++    }
++    if (mb_strlen($v, 'UTF-8') > $maks) errorResponse("$label maksimal $maks karakter");
++    return $v;
++}
++
++function pklAmbilSatu(mysqli $db, string $sql, string $types, array $params): ?array
++{
++    $stmt = $db->prepare($sql);
++    if ($types !== '') $stmt->bind_param($types, ...$params);
++    $stmt->execute();
++    return $stmt->get_result()->fetch_assoc() ?: null;
++}
++
++function pklAmbilSemua(mysqli $db, string $sql, string $types, array $params): array
++{
++    $stmt = $db->prepare($sql);
++    if ($types !== '') $stmt->bind_param($types, ...$params);
++    $stmt->execute();
++    return $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
++}
++
++/**
++ * Nama DU/DI ternormalisasi untuk dedup: huruf kecil, tanda baca jadi spasi, spasi tunggal,
++ * tanpa awalan badan usaha (PT/CV/UD/PD/FA/Firma) dan akhiran Tbk/Persero.
++ */
++function pklNormNama(string $nama): string
++{
++    $n = mb_strtolower($nama, 'UTF-8');
++    $n = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $n) ?? '';
++    $n = trim(preg_replace('/\s+/', ' ', $n) ?? '');
++    $tanpa = preg_replace('/^(pt|cv|ud|pd|fa|firma)\s+/', '', $n) ?? $n;
++    $tanpa = trim(preg_replace('/\s+(tbk|persero)$/', '', $tanpa) ?? $tanpa);
++    return mb_substr($tanpa !== '' ? $tanpa : $n, 0, 255, 'UTF-8');
++}
++
++// ---------------------------------------------------------------------------
++// Tingkat kelas XII
++// ---------------------------------------------------------------------------
++
++/**
++ * Token pertama ("XII" dari "XII TKJ 1" / "XII_TKJ_1") bernilai XII atau 12.
++ */
++function pklTokenXII(?string $teks): bool
++{
++    $t = preg_split('/[\s_.\-]+/', strtoupper(trim((string)$teks)), -1, PREG_SPLIT_NO_EMPTY);
++    return $t && in_array($t[0], ['XII', '12'], true);
++}
++
++/**
++ * Peta kelas: kunci ternormalisasi (id dan nama) => ['id', 'name', 'xii'].
++ * Tingkat dari classes.level; bila kosong, dari token pertama id/nama kelas.
++ */
++function pklPetaKelas(mysqli $db): array
++{
++    static $peta = null;
++    if ($peta !== null) return $peta;
++    $peta = [];
++    try {
++        $res = $db->query("SELECT id, name, level FROM classes");
++        while ($res && ($c = $res->fetch_assoc())) {
++            $level = trim((string)$c['level']);
++            $xii = $level !== '' ? pklTokenXII($level) : (pklTokenXII($c['id']) || pklTokenXII($c['name']));
++            $info = ['id' => (string)$c['id'], 'name' => (string)($c['name'] ?: $c['id']), 'xii' => $xii];
++            foreach ([$c['id'], $c['name']] as $k) {
++                $k = normalizeClassKey($k);
++                if ($k !== '' && !isset($peta[$k])) $peta[$k] = $info;
++            }
++        }
++    } catch (Throwable $e) {
++        // Tabel classes belum ada: semua penentuan memakai token nama kelas
++    }
++    return $peta;
++}
++
++function pklKelasXII(array $peta, ?string $kelasId, ?string $kelasNama = null): bool
++{
++    foreach ([$kelasId, $kelasNama] as $ref) {
++        $k = normalizeClassKey($ref);
++        if ($k !== '' && isset($peta[$k])) return $peta[$k]['xii'];
++    }
++    return pklTokenXII($kelasId) || pklTokenXII($kelasNama);
++}
++
++/**
++ * Syarat pembimbing (§4.1): ada baris teacher_subjects yang menyasar kelas XII.
++ * class_ids (JSON) diutamakan; bila kosong, dipakai class_level.
++ */
++function pklSyaratPembimbing(mysqli $db, string $uid, ?array $baris = null): bool
++{
++    if ($baris === null) {
++        $baris = pklAmbilSemua($db, "SELECT class_level, class_ids FROM teacher_subjects WHERE teacher_id = ?", 's', [$uid]);
++    }
++    $peta = pklPetaKelas($db);
++    foreach ($baris as $r) {
++        $ids = json_decode((string)($r['class_ids'] ?? ''), true);
++        if (is_array($ids) && count($ids) > 0) {
++            foreach ($ids as $cid) {
++                if (is_scalar($cid) && pklKelasXII($peta, (string)$cid)) return true;
++            }
++            continue;
++        }
++        if (pklTokenXII($r['class_level'] ?? '')) return true;
++    }
++    return false;
++}
++
++// ---------------------------------------------------------------------------
++// Konteks & otorisasi
++// ---------------------------------------------------------------------------
++
++/**
++ * Konteks pengguna dari baris users terbaru. null bila role tidak berhak sama sekali.
++ */
++function pklKonteksDari(mysqli $db, array $fresh): ?array
++{
++    $role = (string)$fresh['role'];
++    if (!in_array($role, ['GURU', 'KEPALA_SEKOLAH', 'ADMIN'], true)) return null;
++    $ctx = [
++        'uid'        => (string)$fresh['uid'],
++        'nama'       => (string)$fresh['displayName'],
++        'role'       => $role,
++        'admin'      => $role === 'ADMIN',
++        'kepsek'     => $role === 'KEPALA_SEKOLAH',
++        'guru'       => $role === 'GURU',
++        'pembimbing' => false,
++        'wali'       => null,
++    ];
++    if ($role !== 'GURU') return $ctx;
++
++    $ctx['pembimbing'] = pklSyaratPembimbing($db, $ctx['uid']);
++    $homeroom = trim((string)($fresh['class_homeroom'] ?? ''));
++    if ($homeroom !== '') {
++        $scope = homeroomClassScope($db, $homeroom);
++        $ref = resolveClassRef($db, $scope['classId']);
++        if (pklKelasXII(pklPetaKelas($db), $ref['id'], $ref['name'])) {
++            $ctx['wali'] = ['classId' => $ref['id'], 'className' => $ref['name'], 'classKeys' => $scope['classKeys']];
++        }
++    }
++    return $ctx;
++}
++
++function pklKonteks(mysqli $db): array
++{
++    $ctx = pklKonteksDari($db, loadFreshUser($db, requireAuth()));
++    if ($ctx === null) errorResponse(PKL_MSG_DENY, 403);
++    pklPastikanTabel($db);
++    return $ctx;
++}
++
++/** Boleh melihat master DU/DI dan kandidat siswa. */
++function pklBolehBaca(array $ctx): bool
++{
++    return $ctx['admin'] || $ctx['kepsek'] || $ctx['pembimbing'] || $ctx['wali'] !== null;
++}
++
++/**
++ * Kondisi SQL cakupan baca penempatan untuk GURU: miliknya + kelas perwalian XII.
++ * $alias = alias tabel pkl_penempatan. Admin/Kepsek: tanpa batas ('1=1').
++ */
++function pklKondisiCakupan(array $ctx, string $alias, string &$types, array &$params): string
++{
++    if ($ctx['admin'] || $ctx['kepsek']) return '1=1';
++    $bagian = ["$alias.guru_id = ?"];
++    $types .= 's';
++    $params[] = $ctx['uid'];
++    if ($ctx['wali'] !== null) {
++        $bagian[] = rekapKeyCondition(["$alias.kelas_id", "$alias.kelas_nama"], $ctx['wali']['classKeys'], $types, $params);
++    }
++    return '(' . implode(' OR ', $bagian) . ')';
++}
++
++function pklMilikPenempatan(array $ctx, array $p): bool
++{
++    return $ctx['admin'] || ($ctx['guru'] && $p['guru_id'] === $ctx['uid']);
++}
++
++function pklDalamCakupanWali(array $ctx, ?string $kelasId, ?string $kelasNama): bool
++{
++    if ($ctx['wali'] === null) return false;
++    return in_array(normalizeClassKey($kelasId), $ctx['wali']['classKeys'], true)
++        || in_array(normalizeClassKey($kelasNama), $ctx['wali']['classKeys'], true);
++}
++
++/**
++ * Kunci bernama per siswa agar cek tumpang tindih + insert tidak balapan antar-guru.
++ */
++function pklKunciSiswa(mysqli $db, string $siswaId): void
++{
++    $nama = 'pkl_siswa_' . md5($siswaId);
++    $r = pklAmbilSatu($db, "SELECT GET_LOCK(?, 10) AS ok", 's', [$nama]);
++    if ((int)($r['ok'] ?? 0) !== 1) throw new RuntimeException('Gagal mengunci data siswa, coba lagi.');
++}
++
++function pklLepasKunciSiswa(mysqli $db, string $siswaId): void
++{
++    $nama = 'pkl_siswa_' . md5($siswaId);
++    pklAmbilSatu($db, "SELECT RELEASE_LOCK(?) AS ok", 's', [$nama]);
++}
++
++/**
++ * Penempatan lain milik siswa yang rentangnya beririsan dengan [mulai, selesai].
++ */
++function pklCekTumpangTindih(mysqli $db, string $siswaId, string $mulai, string $selesai, string $kecualiId = ''): ?array
++{
++    return pklAmbilSatu($db,
++        "SELECT id, guru_nama, tanggal_mulai, tanggal_selesai FROM pkl_penempatan
++         WHERE siswa_id = ? AND tanggal_mulai <= ? AND tanggal_selesai >= ? AND id <> ?
++         ORDER BY tanggal_mulai LIMIT 1",
++        'ssss', [$siswaId, $selesai, $mulai, $kecualiId]);
++}
++
++function pklPesanBentrok(array $b): string
++{
++    return 'Siswa sudah dibimbing oleh ' . $b['guru_nama'] . ' (periode '
++        . pklTglPendek($b['tanggal_mulai']) . ' – ' . pklTglPendek($b['tanggal_selesai']) . ')';
++}
++
++function pklStatusPenempatan(string $mulai, string $selesai): string
++{
++    $hari = pklHariIni();
++    if ($mulai > $hari) return 'AKAN_DATANG';
++    if ($selesai < $hari) return 'SELESAI';
++    return 'AKTIF';
++}
++
++function pklValidasiRentang(string $mulai, string $selesai): void
++{
++    if (!pklTanggalValid($mulai) || !pklTanggalValid($selesai)) errorResponse('Tanggal mulai dan selesai wajib diisi dengan benar');
++    if ($selesai < $mulai) errorResponse('Tanggal selesai tidak boleh sebelum tanggal mulai');
++    $hari = (new DateTimeImmutable($mulai))->diff(new DateTimeImmutable($selesai))->days + 1;
++    if ($hari > PKL_MAKS_HARI) errorResponse('Periode penempatan maksimal ' . PKL_MAKS_HARI . ' hari');
++}
++
++function pklRentangJurnal(mysqli $db, string $penempatanId): array
++{
++    $r = pklAmbilSatu($db, "SELECT COUNT(*) AS n, MIN(tanggal) AS awal, MAX(tanggal) AS akhir FROM pkl_jurnal WHERE penempatan_id = ?", 's', [$penempatanId]);
++    return ['n' => (int)($r['n'] ?? 0), 'awal' => $r['awal'] ?? null, 'akhir' => $r['akhir'] ?? null];
++}
++
++// ---------------------------------------------------------------------------
++// Format keluaran
++// ---------------------------------------------------------------------------
++
++const PKL_SQL_PENEMPATAN = "SELECT p.*, d.nama AS dudi_nama, d.alamat AS dudi_alamat, d.bidang_usaha AS dudi_bidang,
++        d.pembimbing_nama AS dudi_pembimbing, d.pembimbing_telp AS dudi_telp,
++        s.id AS s_id, s.nisn AS s_nisn, s.status AS s_status,
++        (SELECT COUNT(*) FROM pkl_jurnal j WHERE j.penempatan_id = p.id) AS jumlah_jurnal,
++        (SELECT MAX(j.tanggal) FROM pkl_jurnal j WHERE j.penempatan_id = p.id) AS jurnal_terakhir
++    FROM pkl_penempatan p
++    LEFT JOIN pkl_dudi d ON d.id = p.dudi_id
++    LEFT JOIN students s ON s.id = p.siswa_id";
++
++function pklBarisPenempatan(array $r, ?array $ctx = null): array
++{
++    $statusSiswa = $r['s_id'] === null ? 'TERHAPUS' : strtoupper(trim((string)$r['s_status']));
++    return [
++        'id'                => $r['id'],
++        'siswa_id'          => $r['siswa_id'],
++        'siswa_nama'        => $r['siswa_nama'],
++        'studentName'       => $r['siswa_nama'],
++        'nisn'              => $r['s_nisn'] ?? null,
++        'kelas_id'          => $r['kelas_id'],
++        'kelas_nama'        => $r['kelas_nama'],
++        'className'         => $r['kelas_nama'],
++        'siswa_status'      => in_array($statusSiswa, ['', 'AKTIF'], true) ? null : $statusSiswa,
++        'dudi_id'           => $r['dudi_id'],
++        'dudi_nama'         => $r['dudi_nama'] ?? '(DU/DI terhapus)',
++        'dudi_alamat'       => $r['dudi_alamat'] ?? null,
++        'dudi_bidang'       => $r['dudi_bidang'] ?? null,
++        'dudi_pembimbing'   => $r['dudi_pembimbing'] ?? null,
++        'dudi_telp'         => $r['dudi_telp'] ?? null,
++        'guru_id'           => $r['guru_id'],
++        'guru_nama'         => $r['guru_nama'],
++        'teacherName'       => $r['guru_nama'],
++        'tanggal_mulai'     => $r['tanggal_mulai'],
++        'tanggal_selesai'   => $r['tanggal_selesai'],
++        'startDate'         => $r['tanggal_mulai'],
++        'endDate'           => $r['tanggal_selesai'],
++        'tahun_ajaran'      => $r['tahun_ajaran'],
++        'status'            => pklStatusPenempatan($r['tanggal_mulai'], $r['tanggal_selesai']),
++        'jumlah_jurnal'     => (int)($r['jumlah_jurnal'] ?? 0),
++        'jurnal_terakhir'   => $r['jurnal_terakhir'] ?? null,
++        'milik'             => $ctx !== null && $ctx['guru'] && $r['guru_id'] === $ctx['uid'],
++        'kelas_wali'        => $ctx !== null && pklDalamCakupanWali($ctx, $r['kelas_id'], $r['kelas_nama']),
++        'bisa_ubah'         => $ctx !== null && pklMilikPenempatan($ctx, $r),
++    ];
++}
++
++function pklAmbilPenempatan(mysqli $db, string $id): ?array
++{
++    return pklAmbilSatu($db, PKL_SQL_PENEMPATAN . " WHERE p.id = ?", 's', [$id]);
++}
++
++function pklFotoDecode(?string $json): array
++{
++    $f = json_decode((string)$json, true);
++    return is_array($f) ? array_values(array_filter($f, 'is_string')) : [];
++}
++
++function pklBarisJurnal(array $r, ?array $ctx = null): array
++{
++    $milik = $ctx !== null && $ctx['guru'] && $r['guru_id'] === $ctx['uid'];
++    return [
++        'id'              => $r['id'],
++        'penempatan_id'   => $r['penempatan_id'],
++        'guru_id'         => $r['guru_id'],
++        'guru_nama'       => $r['guru_nama'],
++        'teacherName'     => $r['guru_nama'],
++        'siswa_id'        => $r['siswa_id'],
++        'siswa_nama'      => $r['siswa_nama'] ?? null,
++        'studentName'     => $r['siswa_nama'] ?? null,
++        'kelas_nama'      => $r['kelas_nama'] ?? null,
++        'dudi_nama'       => $r['dudi_nama'] ?? null,
++        'tanggal'         => $r['tanggal'],
++        'date'            => $r['tanggal'],
++        'jam_mulai'       => $r['jam_mulai'],
++        'jam_selesai'     => $r['jam_selesai'],
++        'jenis'           => $r['jenis'],
++        'jenis_label'     => PKL_JENIS[$r['jenis']] ?? $r['jenis'],
++        'uraian'          => $r['uraian'],
++        'kondisi_siswa'   => $r['kondisi_siswa'],
++        'permasalahan'    => $r['permasalahan'],
++        'tindak_lanjut'   => $r['tindak_lanjut'],
++        'foto'            => pklFotoDecode($r['foto_json']),
++        'dibuat_pada'     => $r['dibuat_pada'],
++        'diubah_pada'     => $r['diubah_pada'],
++        'milik'           => $milik,
++        'bisa_ubah'       => $milik,
++        'bisa_hapus'      => $milik || ($ctx !== null && $ctx['admin']),
++    ];
++}
++
++const PKL_SQL_JURNAL = "SELECT j.*, p.siswa_nama, p.kelas_id, p.kelas_nama, p.dudi_id, d.nama AS dudi_nama
++    FROM pkl_jurnal j
++    JOIN pkl_penempatan p ON p.id = j.penempatan_id
++    LEFT JOIN pkl_dudi d ON d.id = p.dudi_id";
++
++function pklBarisDudi(array $r): array
++{
++    return [
++        'id'                     => $r['id'],
++        'nama'                   => $r['nama'],
++        'bidang_usaha'           => $r['bidang_usaha'],
++        'alamat'                 => $r['alamat'],
++        'pembimbing_nama'        => $r['pembimbing_nama'],
++        'pembimbing_telp'        => $r['pembimbing_telp'],
++        'catatan'                => $r['catatan'],
++        'dibuat_oleh'            => $r['dibuat_oleh'],
++        'jumlah_penempatan'      => (int)($r['jumlah_penempatan'] ?? 0),
++        'jumlah_penempatan_aktif'=> (int)($r['jumlah_penempatan_aktif'] ?? 0),
++    ];
++}
++
++// ---------------------------------------------------------------------------
++// Handler: konteks, DU/DI, kandidat siswa
++// ---------------------------------------------------------------------------
++
++/**
++ * GET ?action=pkl_konteks — peran pengguna untuk menentukan tab UI.
++ * Admin/Kepsek juga menerima daftar guru beserta status syarat pembimbing.
++ */
++function handlePklKonteks(mysqli $db): void
++{
++    pklWajibMetode('GET');
++    $ctx = pklKonteks($db);
++    $hasil = [
++        'peran'         => $ctx['role'],
++        'uid'           => $ctx['uid'],
++        'nama'          => $ctx['nama'],
++        'is_admin'      => $ctx['admin'],
++        'is_kepsek'     => $ctx['kepsek'],
++        'is_pembimbing' => $ctx['pembimbing'],
++        'is_wali_xii'   => $ctx['wali'] !== null,
++        'kelas_wali'    => $ctx['wali'] ? ['id' => $ctx['wali']['classId'], 'nama' => $ctx['wali']['className']] : null,
++        'hari_ini'      => pklHariIni(),
++        'jenis'         => PKL_JENIS,
++    ];
++    if ($ctx['admin'] || $ctx['kepsek']) {
++        $ts = [];
++        foreach (pklAmbilSemua($db, "SELECT teacher_id, class_level, class_ids FROM teacher_subjects", '', []) as $r) {
++            $ts[$r['teacher_id']][] = $r;
++        }
++        $guru = [];
++        foreach (pklAmbilSemua($db, "SELECT uid, displayName FROM users WHERE role = 'GURU' ORDER BY displayName", '', []) as $u) {
++            $guru[] = [
++                'uid'             => $u['uid'],
++                'nama'            => $u['displayName'],
++                'memenuhi_syarat' => pklSyaratPembimbing($db, $u['uid'], $ts[$u['uid']] ?? []),
++            ];
++        }
++        $hasil['guru'] = $guru;
++    }
++    jsonResponse($hasil);
++}
++
++/**
++ * GET ?action=pkl_dudi_list[&q=]
++ */
++function handlePklDudiList(mysqli $db): void
++{
++    pklWajibMetode('GET');
++    $ctx = pklKonteks($db);
++    if (!pklBolehBaca($ctx)) errorResponse(PKL_MSG_DENY, 403);
++
++    $q = trim((string)($_GET['q'] ?? ''));
++    $hari = pklHariIni();
++    $sql = "SELECT d.*,
++                (SELECT COUNT(*) FROM pkl_penempatan p WHERE p.dudi_id = d.id) AS jumlah_penempatan,
++                (SELECT COUNT(*) FROM pkl_penempatan p WHERE p.dudi_id = d.id AND p.tanggal_mulai <= ? AND p.tanggal_selesai >= ?) AS jumlah_penempatan_aktif
++            FROM pkl_dudi d";
++    $types = 'ss';
++    $params = [$hari, $hari];
++    if ($q !== '') {
++        $sql .= " WHERE d.nama LIKE ? OR d.alamat LIKE ? OR d.bidang_usaha LIKE ?";
++        $like = '%' . $q . '%';
++        $types .= 'sss';
++        array_push($params, $like, $like, $like);
++    }
++    $sql .= " ORDER BY d.nama";
++    $items = array_map('pklBarisDudi', pklAmbilSemua($db, $sql, $types, $params));
++    foreach ($items as &$it) {
++        $it['bisa_ubah'] = $ctx['admin'] || ($ctx['pembimbing'] && $it['dibuat_oleh'] === $ctx['uid']);
++        $it['bisa_hapus'] = $ctx['admin'] && $it['jumlah_penempatan'] === 0;
++    }
++    unset($it);
++    jsonResponse(['items' => $items]);
++}
++
++/**
++ * POST ?action=pkl_dudi_simpan — body {id?, nama, bidang_usaha?, alamat?, pembimbing_nama?, pembimbing_telp?, catatan?}
++ */
++function handlePklDudiSimpan(mysqli $db): void
++{
++    pklWajibMetode('POST');
++    $ctx = pklKonteks($db);
++    if (!$ctx['admin'] && !$ctx['pembimbing']) {
++        errorResponse($ctx['guru'] ? PKL_MSG_SYARAT : PKL_MSG_DENY, 403);
++    }
++    $body = getRequestBody();
++    $id = trim((string)($body['id'] ?? ''));
++    $nama = pklTeks($body, 'nama', 255, 'Nama DU/DI', true);
++    $norm = pklNormNama($nama);
++    if ($norm === '') errorResponse('Nama DU/DI tidak valid');
++    $bidang = pklTeks($body, 'bidang_usaha', 150, 'Bidang usaha');
++    $alamat = pklTeks($body, 'alamat', 1000, 'Alamat');
++    $pNama  = pklTeks($body, 'pembimbing_nama', 150, 'Nama pembimbing industri');
++    $pTelp  = pklTeks($body, 'pembimbing_telp', 30, 'Telepon pembimbing industri');
++    if ($pTelp !== null && !preg_match('/^[0-9+()\-\s.]{5,30}$/', $pTelp)) errorResponse('Telepon pembimbing industri tidak valid');
++    $catatan = pklTeks($body, 'catatan', 2000, 'Catatan');
++
++    if ($id !== '') {
++        $lama = pklAmbilSatu($db, "SELECT * FROM pkl_dudi WHERE id = ?", 's', [$id]);
++        if (!$lama) errorResponse('DU/DI tidak ditemukan', 404);
++        if (!$ctx['admin']) {
++            if ($lama['dibuat_oleh'] !== $ctx['uid']) errorResponse('Hanya Admin yang dapat mengubah DU/DI yang ditambahkan guru lain.', 403);
++            $lain = pklAmbilSatu($db, "SELECT COUNT(*) AS n FROM pkl_penempatan WHERE dudi_id = ? AND guru_id <> ?", 'ss', [$id, $ctx['uid']]);
++            if ((int)$lain['n'] > 0) errorResponse('DU/DI ini sudah dipakai guru lain. Minta Admin untuk mengubahnya.', 403);
++        }
++    }
++
++    $sama = pklAmbilSatu($db, "SELECT id, nama FROM pkl_dudi WHERE nama_norm = ? AND id <> ?", 'ss', [$norm, $id]);
++    if ($sama) jsonResponse(['error' => 'DU/DI sudah ada: ' . $sama['nama'], 'existing' => $sama], 409);
++
++    $kini = pklSekarang();
++    try {
++        if ($id === '') {
++            $id = uniqid('dudi_', true);
++            $stmt = $db->prepare("INSERT INTO pkl_dudi (id, nama, nama_norm, bidang_usaha, alamat, pembimbing_nama, pembimbing_telp, catatan, dibuat_oleh, dibuat_pada)
++                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
++            $stmt->bind_param('ssssssssss', $id, $nama, $norm, $bidang, $alamat, $pNama, $pTelp, $catatan, $ctx['uid'], $kini);
++        } else {
++            $stmt = $db->prepare("UPDATE pkl_dudi SET nama = ?, nama_norm = ?, bidang_usaha = ?, alamat = ?, pembimbing_nama = ?, pembimbing_telp = ?, catatan = ?, diubah_pada = ?
++                                  WHERE id = ?");
++            $stmt->bind_param('sssssssss', $nama, $norm, $bidang, $alamat, $pNama, $pTelp, $catatan, $kini, $id);
++        }
++        $stmt->execute();
++    } catch (mysqli_sql_exception $e) {
++        // Balapan dua guru menambah nama yang sama: kunci unik nama_norm
++        if ($e->getCode() === 1062) {
++            $sama = pklAmbilSatu($db, "SELECT id, nama FROM pkl_dudi WHERE nama_norm = ?", 's', [$norm]);
++            jsonResponse(['error' => 'DU/DI sudah ada: ' . ($sama['nama'] ?? $nama), 'existing' => $sama], 409);
++        }
++        throw $e;
++    }
++    $row = pklAmbilSatu($db, "SELECT * FROM pkl_dudi WHERE id = ?", 's', [$id]);
++    jsonResponse(['success' => true, 'item' => pklBarisDudi($row)]);
++}
++
++/**
++ * POST ?action=pkl_dudi_hapus — body {id}. Hanya ADMIN, dan hanya bila tidak dipakai penempatan.
++ */
++function handlePklDudiHapus(mysqli $db): void
++{
++    pklWajibMetode('POST');
++    $ctx = pklKonteks($db);
++    if (!$ctx['admin']) errorResponse('Hanya Admin yang dapat menghapus DU/DI.', 403);
++    $id = trim((string)(getRequestBody()['id'] ?? ''));
++    if (!pklAmbilSatu($db, "SELECT id FROM pkl_dudi WHERE id = ?", 's', [$id])) errorResponse('DU/DI tidak ditemukan', 404);
++    $pakai = pklAmbilSatu($db, "SELECT COUNT(*) AS n FROM pkl_penempatan WHERE dudi_id = ?", 's', [$id]);
++    if ((int)$pakai['n'] > 0) errorResponse('DU/DI masih dipakai ' . (int)$pakai['n'] . ' penempatan, tidak dapat dihapus.', 409);
++    $stmt = $db->prepare("DELETE FROM pkl_dudi WHERE id = ?");
++    $stmt->bind_param('s', $id);
++    $stmt->execute();
++    jsonResponse(['success' => true]);
++}
++
++/**
++ * Siswa aktif kelas XII (opsional satu kelas). Hasil: [kelas[], siswa[]].
++ */
++function pklSiswaXII(mysqli $db, string $kelasFilter = ''): array
++{
++    $peta = pklPetaKelas($db);
++    $rows = pklAmbilSemua($db,
++        "SELECT s.id, s.name, s.nisn, s.class_id, s.class_name FROM students s WHERE " . PKL_SISWA_AKTIF . " ORDER BY s.class_name, s.name",
++        '', []);
++    $kelas = [];
++    $siswa = [];
++    $filterKey = normalizeClassKey($kelasFilter);
++    foreach ($rows as $s) {
++        if (!pklKelasXII($peta, $s['class_id'], $s['class_name'])) continue;
++        $k = normalizeClassKey($s['class_id']);
++        $info = $peta[$k] ?? ($peta[normalizeClassKey($s['class_name'])] ?? null);
++        $kid = $info['id'] ?? (string)$s['class_id'];
++        $knama = $info['name'] ?? (string)($s['class_name'] ?: $s['class_id']);
++        $kelas[$kid] = ['id' => $kid, 'nama' => $knama];
++        if ($filterKey !== '' && !in_array($filterKey, [normalizeClassKey($s['class_id']), normalizeClassKey($s['class_name']), normalizeClassKey($kid)], true)) continue;
++        $siswa[] = [
++            'id'         => $s['id'],
++            'nama'       => $s['name'],
++            'nisn'       => $s['nisn'],
++            'kelas_id'   => (string)$s['class_id'],
++            'kelas_nama' => (string)($s['class_name'] ?: $s['class_id']),
++        ];
++    }
++    $kelas = array_values($kelas);
++    usort($kelas, fn($a, $b) => strnatcasecmp($a['nama'], $b['nama']));
++    return [$kelas, $siswa];
++}
++
++/**
++ * Penempatan aktif atau akan datang per siswa (yang paling awal).
++ */
++function pklPenempatanBerjalan(mysqli $db): array
++{
++    $hasil = [];
++    $rows = pklAmbilSemua($db,
++        "SELECT p.siswa_id, p.guru_id, p.guru_nama, p.tanggal_mulai, p.tanggal_selesai, d.nama AS dudi_nama
++         FROM pkl_penempatan p LEFT JOIN pkl_dudi d ON d.id = p.dudi_id
++         WHERE p.tanggal_selesai >= ? ORDER BY p.tanggal_mulai", 's', [pklHariIni()]);
++    foreach ($rows as $r) {
++        if (isset($hasil[$r['siswa_id']])) continue;
++        $hasil[$r['siswa_id']] = [
++            'guru_id'         => $r['guru_id'],
++            'guru_nama'       => $r['guru_nama'],
++            'dudi_nama'       => $r['dudi_nama'],
++            'tanggal_mulai'   => $r['tanggal_mulai'],
++            'tanggal_selesai' => $r['tanggal_selesai'],
++        ];
++    }
++    return $hasil;
++}
++
++/**
++ * GET ?action=pkl_kandidat_siswa[&kelas_id=]
++ */
++function handlePklKandidatSiswa(mysqli $db): void
++{
++    pklWajibMetode('GET');
++    $ctx = pklKonteks($db);
++    if (!pklBolehBaca($ctx)) errorResponse(PKL_MSG_DENY, 403);
++    [$kelas, $siswa] = pklSiswaXII($db, trim((string)($_GET['kelas_id'] ?? '')));
++    $berjalan = pklPenempatanBerjalan($db);
++    foreach ($siswa as &$s) $s['penempatan_aktif'] = $berjalan[$s['id']] ?? null;
++    unset($s);
++    jsonResponse(['kelas' => $kelas, 'siswa' => $siswa]);
++}
++
++// ---------------------------------------------------------------------------
++// Handler: penempatan
++// ---------------------------------------------------------------------------
++
++/**
++ * GET ?action=pkl_penempatan_list[&guru=&kelas_id=&dudi_id=&status=&siswa=]
++ */
++function handlePklPenempatanList(mysqli $db): void
++{
++    pklWajibMetode('GET');
++    $ctx = pklKonteks($db);
++
++    $types = '';
++    $params = [];
++    $where = [pklKondisiCakupan($ctx, 'p', $types, $params)];
++    foreach (['guru' => 'p.guru_id', 'dudi_id' => 'p.dudi_id', 'siswa' => 'p.siswa_id'] as $q => $kolom) {
++        $v = trim((string)($_GET[$q] ?? ''));
++        if ($v === '') continue;
++        $where[] = "$kolom = ?";
++        $types .= 's';
++        $params[] = $v;
++    }
++    $kelas = trim((string)($_GET['kelas_id'] ?? ''));
++    if ($kelas !== '') $where[] = rekapKeyCondition(['p.kelas_id', 'p.kelas_nama'], [normalizeClassKey($kelas)], $types, $params);
++    $hari = pklHariIni();
++    $status = strtoupper(trim((string)($_GET['status'] ?? '')));
++    if ($status === 'AKTIF') {
++        $where[] = 'p.tanggal_mulai <= ? AND p.tanggal_selesai >= ?';
++        $types .= 'ss';
++        array_push($params, $hari, $hari);
++    } elseif ($status === 'AKAN_DATANG') {
++        $where[] = 'p.tanggal_mulai > ?';
++        $types .= 's';
++        $params[] = $hari;
++    } elseif ($status === 'SELESAI') {
++        $where[] = 'p.tanggal_selesai < ?';
++        $types .= 's';
++        $params[] = $hari;
++    }
++
++    $rows = pklAmbilSemua($db,
++        PKL_SQL_PENEMPATAN . ' WHERE ' . implode(' AND ', $where) . ' ORDER BY p.kelas_nama, p.siswa_nama, p.tanggal_mulai',
++        $types, $params);
++    $hasil = ['items' => array_map(fn($r) => pklBarisPenempatan($r, $ctx), $rows)];
++
++    // Siswa XII aktif tanpa penempatan aktif/akan datang (Pantau & wali kelas)
++    if ($ctx['admin'] || $ctx['kepsek'] || $ctx['wali'] !== null) {
++        $berjalan = pklPenempatanBerjalan($db);
++        [, $siswa] = pklSiswaXII($db);
++        $belum = [];
++        foreach ($siswa as $s) {
++            if (isset($berjalan[$s['id']])) continue;
++            if (!$ctx['admin'] && !$ctx['kepsek'] && !pklDalamCakupanWali($ctx, $s['kelas_id'], $s['kelas_nama'])) continue;
++            $belum[] = $s;
++        }
++        $hasil['belum_ditempatkan'] = $belum;
++    }
++    jsonResponse($hasil);
++}
++
++/**
++ * Guru pembimbing tujuan penempatan baru. ADMIN memilih guru_id; GURU selalu dirinya sendiri.
++ */
++function pklGuruTujuan(mysqli $db, array $ctx, string $guruId): array
++{
++    if ($ctx['guru']) {
++        if (!$ctx['pembimbing']) errorResponse(PKL_MSG_SYARAT, 403);
++        return ['uid' => $ctx['uid'], 'nama' => $ctx['nama']];
++    }
++    if (!$ctx['admin']) errorResponse('Kepala Sekolah hanya dapat memantau Bimbingan PKL.', 403);
++    if ($guruId === '') errorResponse('Pilih guru pembimbing');
++    $g = pklAmbilSatu($db, "SELECT uid, displayName, role FROM users WHERE uid = ?", 's', [$guruId]);
++    if (!$g || $g['role'] !== 'GURU') errorResponse('Guru pembimbing tidak ditemukan');
++    if (!pklSyaratPembimbing($db, $g['uid'])) errorResponse($g['displayName'] . ' tidak memiliki penugasan mapel kelas XII, sehingga tidak dapat menjadi pembimbing PKL.');
++    return ['uid' => $g['uid'], 'nama' => $g['displayName']];
++}
++
++/**
++ * POST ?action=pkl_penempatan_simpan
++ *  Buat : {siswa_ids[] | siswa_id, dudi_id, tanggal_mulai, tanggal_selesai, guru_id? (ADMIN)}
++ *  Ubah : {id, dudi_id, tanggal_mulai, tanggal_selesai}
++ */
++function handlePklPenempatanSimpan(mysqli $db): void
++{
++    pklWajibMetode('POST');
++    $ctx = pklKonteks($db);
++    if (!$ctx['admin'] && !$ctx['guru']) errorResponse('Kepala Sekolah hanya dapat memantau Bimbingan PKL.', 403);
++    $body = getRequestBody();
++    $id = trim((string)($body['id'] ?? ''));
++    if ($id === '' && $ctx['guru'] && !$ctx['pembimbing']) errorResponse(PKL_MSG_SYARAT, 403);
++    $mulai = (string)($body['tanggal_mulai'] ?? '');
++    $selesai = (string)($body['tanggal_selesai'] ?? '');
++    pklValidasiRentang($mulai, $selesai);
++    $dudiId = trim((string)($body['dudi_id'] ?? ''));
++    if ($dudiId === '' || !pklAmbilSatu($db, "SELECT id FROM pkl_dudi WHERE id = ?", 's', [$dudiId])) errorResponse('Pilih DU/DI tempat PKL');
++
++    if ($id !== '') {
++        pklPenempatanUbah($db, $ctx, $id, $dudiId, $mulai, $selesai);
++        return;
++    }
++
++    $guru = pklGuruTujuan($db, $ctx, trim((string)($body['guru_id'] ?? '')));
++    $ids = $body['siswa_ids'] ?? (isset($body['siswa_id']) ? [$body['siswa_id']] : []);
++    if (!is_array($ids)) $ids = [];
++    $ids = array_values(array_unique(array_filter(array_map(fn($v) => is_scalar($v) ? trim((string)$v) : '', $ids), fn($v) => $v !== '')));
++    if (!$ids) errorResponse('Pilih minimal satu siswa');
++    if (count($ids) > 60) errorResponse('Maksimal 60 siswa sekali simpan');
++
++    $ph = implode(',', array_fill(0, count($ids), '?'));
++    $siswa = [];
++    foreach (pklAmbilSemua($db, "SELECT id, name, class_id, class_name, status FROM students WHERE id IN ($ph)", str_repeat('s', count($ids)), $ids) as $s) {
++        $siswa[$s['id']] = $s;
++    }
++    $peta = pklPetaKelas($db);
++    [$tahunAjaran] = activeAcademicPeriod($db);
++    $kini = pklSekarang();
++
++    $tersimpan = [];
++    $gagal = [];
++    $adaBentrok = false;
++    foreach ($ids as $sid) {
++        $s = $siswa[$sid] ?? null;
++        $namaSiswa = $s['name'] ?? $sid;
++        if (!$s) { $gagal[] = ['siswa_id' => $sid, 'nama' => $sid, 'alasan' => 'Siswa tidak ditemukan']; continue; }
++        $st = strtoupper(trim((string)$s['status']));
++        if ($st !== '' && $st !== 'AKTIF') { $gagal[] = ['siswa_id' => $sid, 'nama' => $namaSiswa, 'alasan' => 'Siswa tidak berstatus aktif']; continue; }
++        if (!pklKelasXII($peta, $s['class_id'], $s['class_name'])) { $gagal[] = ['siswa_id' => $sid, 'nama' => $namaSiswa, 'alasan' => 'Siswa bukan kelas XII']; continue; }
++
++        pklKunciSiswa($db, $sid);
++        try {
++            $bentrok = pklCekTumpangTindih($db, $sid, $mulai, $selesai);
++            if ($bentrok) {
++                $adaBentrok = true;
++                $gagal[] = ['siswa_id' => $sid, 'nama' => $namaSiswa, 'alasan' => pklPesanBentrok($bentrok)];
++                continue;
++            }
++            $pid = uniqid('pklp_', true);
++            $kelasNama = (string)($s['class_name'] ?: $s['class_id']);
++            $stmt = $db->prepare("INSERT INTO pkl_penempatan (id, siswa_id, siswa_nama, kelas_id, kelas_nama, dudi_id, guru_id, guru_nama,
++                                    tanggal_mulai, tanggal_selesai, tahun_ajaran, dibuat_oleh, dibuat_pada)
++                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
++            $stmt->bind_param('sssssssssssss', $pid, $sid, $s['name'], $s['class_id'], $kelasNama, $dudiId, $guru['uid'], $guru['nama'],
++                $mulai, $selesai, $tahunAjaran, $ctx['uid'], $kini);
++            $stmt->execute();
++            $tersimpan[] = pklBarisPenempatan(pklAmbilPenempatan($db, $pid), $ctx);
++        } finally {
++            pklLepasKunciSiswa($db, $sid);
++        }
++    }
++
++    if (!$tersimpan) {
++        jsonResponse(['error' => $gagal[0]['alasan'] ?? 'Tidak ada penempatan yang tersimpan', 'gagal' => $gagal], $adaBentrok ? 409 : 400);
++    }
++    jsonResponse(['success' => true, 'tersimpan' => $tersimpan, 'gagal' => $gagal]);
++}
++
++function pklPenempatanUbah(mysqli $db, array $ctx, string $id, string $dudiId, string $mulai, string $selesai): void
++{
++    $p = pklAmbilPenempatan($db, $id);
++    if (!$p) errorResponse('Penempatan tidak ditemukan', 404);
++    if (!pklMilikPenempatan($ctx, $p)) errorResponse('Anda hanya dapat mengubah penempatan siswa bimbingan Anda sendiri.', 403);
++
++    $rj = pklRentangJurnal($db, $id);
++    if ($rj['n'] > 0) {
++        if ($dudiId !== $p['dudi_id']) errorResponse('Penempatan sudah memiliki jurnal, DU/DI tidak dapat diganti. Tutup penempatan ini lalu buat penempatan baru.');
++        if ($mulai > $rj['awal'] || $selesai < $rj['akhir']) {
++            errorResponse('Periode harus tetap mencakup tanggal jurnal yang sudah ada (' . pklTglPendek($rj['awal']) . ' – ' . pklTglPendek($rj['akhir']) . ')');
++        }
++    }
++
++    pklKunciSiswa($db, $p['siswa_id']);
++    try {
++        $bentrok = pklCekTumpangTindih($db, $p['siswa_id'], $mulai, $selesai, $id);
++        if ($bentrok) errorResponse(pklPesanBentrok($bentrok), 409);
++        $kini = pklSekarang();
++        $stmt = $db->prepare("UPDATE pkl_penempatan SET dudi_id = ?, tanggal_mulai = ?, tanggal_selesai = ?, diubah_oleh = ?, diubah_pada = ? WHERE id = ?");
++        $stmt->bind_param('ssssss', $dudiId, $mulai, $selesai, $ctx['uid'], $kini, $id);
++        $stmt->execute();
++    } finally {
++        pklLepasKunciSiswa($db, $p['siswa_id']);
++    }
++    jsonResponse(['success' => true, 'tersimpan' => [pklBarisPenempatan(pklAmbilPenempatan($db, $id), $ctx)], 'gagal' => []]);
++}
++
++/**
++ * POST ?action=pkl_penempatan_tutup — body {id, tanggal_selesai}. Memajukan tanggal selesai.
++ */
++function handlePklPenempatanTutup(mysqli $db): void
++{
++    pklWajibMetode('POST');
++    $ctx = pklKonteks($db);
++    $body = getRequestBody();
++    $id = trim((string)($body['id'] ?? ''));
++    $tgl = (string)($body['tanggal_selesai'] ?? '');
++    $p = pklAmbilPenempatan($db, $id);
++    if (!$p) errorResponse('Penempatan tidak ditemukan', 404);
++    if (!pklMilikPenempatan($ctx, $p)) errorResponse('Anda hanya dapat menutup penempatan siswa bimbingan Anda sendiri.', 403);
++    if (!pklTanggalValid($tgl)) errorResponse('Tanggal selesai tidak valid');
++    if ($tgl < $p['tanggal_mulai']) errorResponse('Tanggal selesai tidak boleh sebelum tanggal mulai (' . pklTglPendek($p['tanggal_mulai']) . ')');
++    if ($tgl > $p['tanggal_selesai']) errorResponse('Tanggal tutup tidak boleh melewati tanggal selesai saat ini (' . pklTglPendek($p['tanggal_selesai']) . '). Gunakan Ubah untuk memperpanjang.');
++    $rj = pklRentangJurnal($db, $id);
++    if ($rj['n'] > 0 && $tgl < $rj['akhir']) errorResponse('Tanggal selesai tidak boleh sebelum jurnal terakhir (' . pklTglPendek($rj['akhir']) . ')');
++
++    $kini = pklSekarang();
++    $stmt = $db->prepare("UPDATE pkl_penempatan SET tanggal_selesai = ?, diubah_oleh = ?, diubah_pada = ? WHERE id = ?");
++    $stmt->bind_param('ssss', $tgl, $ctx['uid'], $kini, $id);
++    $stmt->execute();
++    jsonResponse(['success' => true, 'item' => pklBarisPenempatan(pklAmbilPenempatan($db, $id), $ctx)]);
++}
++
++/**
++ * POST ?action=pkl_penempatan_alih — body {id, guru_id_baru, tanggal_alih}. Hanya ADMIN.
++ * Penempatan lama berakhir di tanggal_alih; penempatan baru (guru baru) mulai tanggal_alih + 1.
++ */
++function handlePklPenempatanAlih(mysqli $db): void
++{
++    pklWajibMetode('POST');
++    $ctx = pklKonteks($db);
++    if (!$ctx['admin']) errorResponse('Hanya Admin yang dapat mengalihkan pembimbing.', 403);
++    $body = getRequestBody();
++    $id = trim((string)($body['id'] ?? ''));
++    $tgl = (string)($body['tanggal_alih'] ?? '');
++    $p = pklAmbilPenempatan($db, $id);
++    if (!$p) errorResponse('Penempatan tidak ditemukan', 404);
++    if (!pklTanggalValid($tgl)) errorResponse('Tanggal alih tidak valid');
++    if ($tgl < $p['tanggal_mulai'] || $tgl >= $p['tanggal_selesai']) {
++        errorResponse('Tanggal alih harus di antara ' . pklTglPendek($p['tanggal_mulai']) . ' dan sehari sebelum ' . pklTglPendek($p['tanggal_selesai']));
++    }
++    $guruBaru = trim((string)($body['guru_id_baru'] ?? ''));
++    if ($guruBaru === $p['guru_id']) errorResponse('Guru baru sama dengan pembimbing saat ini');
++    $guru = pklGuruTujuan($db, $ctx, $guruBaru);
++    $rj = pklRentangJurnal($db, $id);
++    if ($rj['n'] > 0 && $rj['akhir'] > $tgl) {
++        errorResponse('Sudah ada jurnal setelah tanggal alih (terakhir ' . pklTglPendek($rj['akhir']) . '). Pilih tanggal alih ≥ tanggal jurnal terakhir.');
++    }
++
++    $baruId = uniqid('pklp_', true);
++    $mulaiBaru = pklTambahHari($tgl, 1);
++    $kini = pklSekarang();
++    pklKunciSiswa($db, $p['siswa_id']);
++    $db->begin_transaction();
++    try {
++        $stmt = $db->prepare("UPDATE pkl_penempatan SET tanggal_selesai = ?, diubah_oleh = ?, diubah_pada = ? WHERE id = ?");
++        $stmt->bind_param('ssss', $tgl, $ctx['uid'], $kini, $id);
++        $stmt->execute();
++        $stmt = $db->prepare("INSERT INTO pkl_penempatan (id, siswa_id, siswa_nama, kelas_id, kelas_nama, dudi_id, guru_id, guru_nama,
++                                tanggal_mulai, tanggal_selesai, tahun_ajaran, dibuat_oleh, dibuat_pada)
++                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
++        $stmt->bind_param('sssssssssssss', $baruId, $p['siswa_id'], $p['siswa_nama'], $p['kelas_id'], $p['kelas_nama'], $p['dudi_id'],
++            $guru['uid'], $guru['nama'], $mulaiBaru, $p['tanggal_selesai'], $p['tahun_ajaran'], $ctx['uid'], $kini);
++        $stmt->execute();
++        $db->commit();
++    } catch (Throwable $e) {
++        $db->rollback();
++        error_log('[SIMANTAP] pkl_penempatan_alih: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
++        errorResponse('Gagal mengalihkan pembimbing', 500);
++    } finally {
++        pklLepasKunciSiswa($db, $p['siswa_id']);
++    }
++    jsonResponse([
++        'success' => true,
++        'lama'    => pklBarisPenempatan(pklAmbilPenempatan($db, $id), $ctx),
++        'baru'    => pklBarisPenempatan(pklAmbilPenempatan($db, $baruId), $ctx),
++    ]);
++}
++
++/**
++ * POST ?action=pkl_penempatan_hapus — body {id}. Hanya penempatan tanpa jurnal.
++ */
++function handlePklPenempatanHapus(mysqli $db): void
++{
++    pklWajibMetode('POST');
++    $ctx = pklKonteks($db);
++    $id = trim((string)(getRequestBody()['id'] ?? ''));
++    $p = pklAmbilPenempatan($db, $id);
++    if (!$p) errorResponse('Penempatan tidak ditemukan', 404);
++    if (!pklMilikPenempatan($ctx, $p)) errorResponse('Anda hanya dapat menghapus penempatan siswa bimbingan Anda sendiri.', 403);
++    if (pklRentangJurnal($db, $id)['n'] > 0) errorResponse('Penempatan sudah memiliki jurnal, tidak dapat dihapus. Gunakan Tutup Penempatan.', 409);
++    $stmt = $db->prepare("DELETE FROM pkl_penempatan WHERE id = ?");
++    $stmt->bind_param('s', $id);
++    $stmt->execute();
++    jsonResponse(['success' => true]);
++}
++
++// ---------------------------------------------------------------------------
++// Handler: jurnal
++// ---------------------------------------------------------------------------
++
++/**
++ * GET ?action=pkl_jurnal_list[&bulan=YYYY-MM&penempatan_id=&siswa=&guru=]
++ * Tanpa filter apa pun: bulan berjalan.
++ */
++function handlePklJurnalList(mysqli $db): void
++{
++    pklWajibMetode('GET');
++    $ctx = pklKonteks($db);
++
++    $types = '';
++    $params = [];
++    $cakupan = pklKondisiCakupan($ctx, 'p', $types, $params);
++    // GURU juga melihat jurnal yang ia tulis di penempatan yang sudah dialihkan
++    if (!$ctx['admin'] && !$ctx['kepsek']) {
++        $cakupan = "($cakupan OR j.guru_id = ?)";
++        $types .= 's';
++        $params[] = $ctx['uid'];
++    }
++    $where = [$cakupan];
++
++    $adaFilter = false;
++    foreach (['penempatan_id' => 'j.penempatan_id', 'siswa' => 'j.siswa_id', 'guru' => 'j.guru_id'] as $q => $kolom) {
++        $v = trim((string)($_GET[$q] ?? ''));
++        if ($v === '') continue;
++        $where[] = "$kolom = ?";
++        $types .= 's';
++        $params[] = $v;
++        if ($q !== 'guru') $adaFilter = true;
++    }
++    $bulan = trim((string)($_GET['bulan'] ?? ''));
++    if ($bulan === '' && !$adaFilter) $bulan = date('Y-m');
++    if ($bulan !== '') {
++        if (!preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $bulan)) errorResponse('Format bulan tidak valid (YYYY-MM)');
++        $awal = $bulan . '-01';
++        $akhir = (new DateTimeImmutable($awal))->format('Y-m-t');
++        $where[] = 'j.tanggal BETWEEN ? AND ?';
++        $types .= 'ss';
++        array_push($params, $awal, $akhir);
++    }
++    $rows = pklAmbilSemua($db,
++        PKL_SQL_JURNAL . ' WHERE ' . implode(' AND ', $where) . ' ORDER BY j.tanggal DESC, j.jam_mulai DESC',
++        $types, $params);
++    jsonResponse(['bulan' => $bulan ?: null, 'items' => array_map(fn($r) => pklBarisJurnal($r, $ctx), $rows)]);
++}
++
++/**
++ * Validasi foto: array path hasil pkl_unggah_foto, maks 3, file harus ada.
++ */
++function pklValidasiFoto($foto): array
++{
++    if ($foto === null || $foto === '') return [];
++    if (!is_array($foto)) errorResponse('Data foto tidak valid');
++    $hasil = [];
++    foreach ($foto as $f) {
++        if (!is_string($f) || !preg_match(PKL_POLA_FOTO, $f)) errorResponse('Foto tidak valid, unggah ulang');
++        if (!is_file(dirname(__DIR__) . '/' . $f)) errorResponse('Foto tidak ditemukan, unggah ulang');
++        $hasil[] = $f;
++    }
++    $hasil = array_values(array_unique($hasil));
++    if (count($hasil) > PKL_MAKS_FOTO) errorResponse('Maksimal ' . PKL_MAKS_FOTO . ' foto');
++    return $hasil;
++}
++
++/**
++ * Hapus file foto yang tidak lagi dipakai jurnal mana pun.
++ */
++function pklHapusFotoYatim(mysqli $db, array $paths): void
++{
++    foreach ($paths as $f) {
++        if (!is_string($f) || !preg_match(PKL_POLA_FOTO, $f)) continue;
++        $pakai = pklAmbilSatu($db, "SELECT COUNT(*) AS n FROM pkl_jurnal WHERE foto_json LIKE ?", 's', ['%' . $f . '%']);
++        $berkas = dirname(__DIR__) . '/' . $f;
++        if ((int)$pakai['n'] === 0 && is_file($berkas)) @unlink($berkas);
++    }
++}
++
++/**
++ * POST ?action=pkl_jurnal_simpan
++ * body {id?, penempatan_id, tanggal, jam_mulai, jam_selesai, jenis, uraian, kondisi_siswa?, permasalahan?, tindak_lanjut?, foto?[]}
++ */
++function handlePklJurnalSimpan(mysqli $db): void
++{
++    pklWajibMetode('POST');
++    $ctx = pklKonteks($db);
++    if (!$ctx['guru']) errorResponse('Jurnal bimbingan hanya ditulis oleh guru pembimbing.', 403);
++    $body = getRequestBody();
++
++    $id = trim((string)($body['id'] ?? ''));
++    $lama = null;
++    if ($id !== '') {
++        $lama = pklAmbilSatu($db, "SELECT * FROM pkl_jurnal WHERE id = ?", 's', [$id]);
++        if (!$lama) errorResponse('Jurnal tidak ditemukan', 404);
++        if ($lama['guru_id'] !== $ctx['uid']) errorResponse('Anda hanya dapat mengubah jurnal Anda sendiri.', 403);
++        $penempatanId = $lama['penempatan_id'];
++    } else {
++        $penempatanId = trim((string)($body['penempatan_id'] ?? ''));
++    }
++
++    $p = pklAmbilPenempatan($db, $penempatanId);
++    if (!$p) errorResponse('Pilih siswa bimbingan', $penempatanId === '' ? 400 : 404);
++    if ($lama === null && $p['guru_id'] !== $ctx['uid']) errorResponse('Anda hanya dapat menulis jurnal untuk siswa bimbingan Anda sendiri.', 403);
++
++    $tanggal = (string)($body['tanggal'] ?? '');
++    if (!pklTanggalValid($tanggal)) errorResponse('Tanggal tidak valid');
++    if ($tanggal > pklHariIni()) errorResponse('Tanggal jurnal tidak boleh di masa depan');
++    if ($tanggal < $p['tanggal_mulai'] || $tanggal > $p['tanggal_selesai']) {
++        errorResponse('Tanggal jurnal harus dalam periode penempatan (' . pklTglPendek($p['tanggal_mulai']) . ' – ' . pklTglPendek($p['tanggal_selesai']) . ')');
++    }
++    $jamMulai = (string)($body['jam_mulai'] ?? '');
++    $jamSelesai = (string)($body['jam_selesai'] ?? '');
++    $polaJam = '/^([01]\d|2[0-3]):[0-5]\d$/';
++    if (!preg_match($polaJam, $jamMulai) || !preg_match($polaJam, $jamSelesai)) errorResponse('Jam mulai dan selesai wajib diisi (format JJ:MM)');
++    if ($jamSelesai <= $jamMulai) errorResponse('Jam selesai harus setelah jam mulai');
++    $jenis = strtoupper(trim((string)($body['jenis'] ?? '')));
++    if (!isset(PKL_JENIS[$jenis])) errorResponse('Jenis kegiatan tidak dikenal');
++    $uraian = pklTeks($body, 'uraian', 5000, 'Uraian kegiatan/materi bimbingan', true);
++    $kondisi = pklTeks($body, 'kondisi_siswa', 2000, 'Kondisi/perkembangan siswa');
++    $masalah = pklTeks($body, 'permasalahan', 2000, 'Permasalahan');
++    $tindak = pklTeks($body, 'tindak_lanjut', 2000, 'Tindak lanjut');
++    $foto = pklValidasiFoto($body['foto'] ?? []);
++    $fotoJson = $foto ? json_encode($foto, JSON_UNESCAPED_SLASHES) : null;
++    $kini = pklSekarang();
++
++    if ($lama === null) {
++        $id = uniqid('pklj_', true);
++        $stmt = $db->prepare("INSERT INTO pkl_jurnal (id, penempatan_id, guru_id, guru_nama, siswa_id, tanggal, jam_mulai, jam_selesai, jenis,
++                                uraian, kondisi_siswa, permasalahan, tindak_lanjut, foto_json, dibuat_pada)
++                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
++        $stmt->bind_param('sssssssssssssss', $id, $penempatanId, $ctx['uid'], $ctx['nama'], $p['siswa_id'], $tanggal, $jamMulai, $jamSelesai,
++            $jenis, $uraian, $kondisi, $masalah, $tindak, $fotoJson, $kini);
++    } else {
++        $stmt = $db->prepare("UPDATE pkl_jurnal SET tanggal = ?, jam_mulai = ?, jam_selesai = ?, jenis = ?, uraian = ?, kondisi_siswa = ?,
++                                permasalahan = ?, tindak_lanjut = ?, foto_json = ?, diubah_pada = ? WHERE id = ?");
++        $stmt->bind_param('sssssssssss', $tanggal, $jamMulai, $jamSelesai, $jenis, $uraian, $kondisi, $masalah, $tindak, $fotoJson, $kini, $id);
++    }
++    $stmt->execute();
++    if ($lama !== null) pklHapusFotoYatim($db, array_diff(pklFotoDecode($lama['foto_json']), $foto));
++
++    $row = pklAmbilSatu($db, PKL_SQL_JURNAL . " WHERE j.id = ?", 's', [$id]);
++    jsonResponse(['success' => true, 'item' => pklBarisJurnal($row, $ctx)]);
++}
++
++/**
++ * POST ?action=pkl_jurnal_hapus — body {id}. Pemilik atau ADMIN.
++ */
++function handlePklJurnalHapus(mysqli $db): void
++{
++    pklWajibMetode('POST');
++    $ctx = pklKonteks($db);
++    $id = trim((string)(getRequestBody()['id'] ?? ''));
++    $j = pklAmbilSatu($db, "SELECT * FROM pkl_jurnal WHERE id = ?", 's', [$id]);
++    if (!$j) errorResponse('Jurnal tidak ditemukan', 404);
++    if (!$ctx['admin'] && !($ctx['guru'] && $j['guru_id'] === $ctx['uid'])) errorResponse('Anda hanya dapat menghapus jurnal Anda sendiri.', 403);
++    $stmt = $db->prepare("DELETE FROM pkl_jurnal WHERE id = ?");
++    $stmt->bind_param('s', $id);
++    $stmt->execute();
++    pklHapusFotoYatim($db, pklFotoDecode($j['foto_json']));
++    jsonResponse(['success' => true]);
++}
++
++/**
++ * POST multipart ?action=pkl_unggah_foto — field "file" (JPG/PNG/WEBP, maks 2 MB).
++ * Pembimbing yang memenuhi syarat, atau guru yang masih punya penempatan (melanjutkan jurnal).
++ */
++function handlePklUnggahFoto(mysqli $db): void
++{
++    pklWajibMetode('POST');
++    $ctx = pklKonteks($db);
++    if (!$ctx['guru']) errorResponse('Foto bimbingan hanya diunggah oleh guru pembimbing.', 403);
++    if (!$ctx['pembimbing']) {
++        $punya = pklAmbilSatu($db, "SELECT COUNT(*) AS n FROM pkl_penempatan WHERE guru_id = ?", 's', [$ctx['uid']]);
++        if ((int)$punya['n'] === 0) errorResponse(PKL_MSG_SYARAT, 403);
++    }
++
++    $f = $_FILES['file'] ?? null;
++    if (!$f || !is_array($f) || ($f['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK || !is_uploaded_file($f['tmp_name'])) {
++        $kode = is_array($f) ? ($f['error'] ?? null) : null;
++        errorResponse(in_array($kode, [UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE], true) ? 'Ukuran foto maksimal 2 MB' : 'Foto gagal diunggah');
++    }
++    if ((int)$f['size'] > PKL_MAKS_UNGGAH) errorResponse('Ukuran foto maksimal 2 MB');
++    $mime = (new finfo(FILEINFO_MIME_TYPE))->file($f['tmp_name']);
++    $ext = PKL_MIME_FOTO[$mime] ?? null;
++    if ($ext === null) errorResponse('Foto harus berupa JPG, PNG, atau WEBP');
++
++    $sub = 'uploads/journals/pkl/' . date('Ym');
++    $dir = dirname(__DIR__) . '/' . $sub;
++    if (!is_dir($dir) && !mkdir($dir, 0755, true)) errorResponse('Folder unggahan tidak dapat dibuat', 500);
++    foreach ([dirname($dir, 2), dirname($dir), $dir] as $d) {
++        if (!is_file("$d/index.html")) @file_put_contents("$d/index.html", '');
++    }
++    $nama = bin2hex(random_bytes(16)) . '.' . $ext;
++    if (!move_uploaded_file($f['tmp_name'], "$dir/$nama")) errorResponse('Foto gagal disimpan', 500);
++    jsonResponse(['success' => true, 'path' => "$sub/$nama"]);
++}
++
++// ---------------------------------------------------------------------------
++// Halaman cetak (HTML A4)
++// ---------------------------------------------------------------------------
++
++function pklHtmlError(int $status, string $pesan): void
++{
++    rekapSendHeaders($status);
++    $tambahan = $status === 401 ? '<p><a href="../">Buka halaman login</a></p>' : '';
++    echo '<!doctype html><html lang="id"><head><meta charset="utf-8">'
++        . '<meta name="viewport" content="width=device-width, initial-scale=1">'
++        . '<title>Bimbingan PKL - Error ' . $status . '</title>'
++        . '<style>body{font-family:Arial,Helvetica,sans-serif;background:#f1f5f9;color:#0f172a;margin:0;padding:40px 16px}'
++        . '.box{max-width:560px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:24px}'
++        . 'h1{font-size:18px;margin:0 0 8px}p{margin:8px 0;line-height:1.5}a{color:#047857}</style></head><body>'
++        . '<div class="box"><h1>Dokumen Bimbingan PKL tidak dapat ditampilkan</h1>'
++        . '<p>' . rekapEsc($pesan) . '</p>' . $tambahan . '</div></body></html>';
++    exit;
++}
++
++/**
++ * Konteks untuk halaman cetak: galat berupa HTML, bukan JSON.
++ */
++function pklKonteksCetak(mysqli $db): array
++{
++    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
++        header('Allow: GET');
++        pklHtmlError(405, 'Metode tidak diizinkan.');
++    }
++    $sesi = getCurrentUser();
++    if (!$sesi || empty($sesi['uid'])) pklHtmlError(401, 'Sesi Anda telah berakhir. Silakan login ulang.');
++    $fresh = pklAmbilSatu($db, "SELECT uid, displayName, role, class_homeroom, is_bk FROM users WHERE uid = ? LIMIT 1", 's', [$sesi['uid']]);
++    if (!$fresh) pklHtmlError(401, 'Sesi Anda telah berakhir. Silakan login ulang.');
++    $ctx = pklKonteksDari($db, $fresh);
++    if ($ctx === null) pklHtmlError(403, PKL_MSG_DENY);
++    pklPastikanTabel($db);
++    return $ctx;
++}
++
++function pklTtdKotaTanggal(array $kop, string $tanggalDefault): array
++{
++    $kotaRaw = $_GET['kota'] ?? null;
++    $kota = $kotaRaw === null ? ($kop['kop_kota'] ?? '') : trim((string)$kotaRaw);
++    $kota = mb_substr($kota, 0, 50, 'UTF-8');
++    $tglRaw = trim((string)($_GET['tgl_ttd'] ?? ''));
++    $tgl = $tanggalDefault;
++    if ($tglRaw !== '') {
++        if (!pklTanggalValid($tglRaw)) pklHtmlError(400, 'Tanggal tanda tangan tidak valid (gunakan YYYY-MM-DD).');
++        $tgl = $tglRaw;
++    }
++    return [$kota, $tgl, $tglRaw];
++}
++
++function pklNamaGuru(mysqli $db, string $uid, string $cadangan): array
++{
++    $u = pklAmbilSatu($db, "SELECT displayName, nip FROM users WHERE uid = ?", 's', [$uid]);
++    return ['nama' => $u['displayName'] ?? $cadangan, 'nip' => trim((string)($u['nip'] ?? ''))];
++}
++
++function pklMenit(string $mulai, string $selesai): int
++{
++    [$h1, $m1] = array_map('intval', explode(':', $mulai));
++    [$h2, $m2] = array_map('intval', explode(':', $selesai));
++    return max(0, ($h2 * 60 + $m2) - ($h1 * 60 + $m1));
++}
++
++function pklLabelDurasi(int $menit): string
++{
++    $j = intdiv($menit, 60);
++    $m = $menit % 60;
++    return trim(($j ? "$j jam " : '') . ($m ? "$m menit" : '')) ?: '0 menit';
++}
++
++function pklNamaHari(string $ymd): string
++{
++    $hari = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
++    return $hari[(int)(new DateTimeImmutable($ymd))->format('w')];
++}
++
++/**
++ * GET ?action=pkl_cetak_rekap&bulan=YYYY-MM[&guru=&kota=&tgl_ttd=&foto=1]
++ */
++function handlePklCetakRekap(mysqli $db): void
++{
++    $ctx = pklKonteksCetak($db);
++    try {
++        $guruId = trim((string)($_GET['guru'] ?? ''));
++        if ($ctx['guru']) {
++            if ($guruId !== '' && $guruId !== $ctx['uid']) pklHtmlError(403, 'Anda hanya dapat mencetak rekap bimbingan Anda sendiri.');
++            $guruId = $ctx['uid'];
++        } elseif ($guruId === '') {
++            pklHtmlError(400, 'Pilih guru pembimbing yang rekapnya akan dicetak.');
++        }
++
++        $kini = new DateTimeImmutable('now');
++        $bulanIni = $kini->format('Y-m');
++        $bulan = trim((string)($_GET['bulan'] ?? '')) ?: $bulanIni;
++        if (!preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $bulan)) pklHtmlError(400, 'Format bulan tidak valid (gunakan YYYY-MM).');
++        if ($bulan > $bulanIni) pklHtmlError(400, 'Bulan belum berjalan.');
++        $awal = $bulan . '-01';
++        $akhir = (new DateTimeImmutable($awal))->format('Y-m-t');
++        $berjalan = $bulan === $bulanIni;
++
++        $rows = pklAmbilSemua($db, PKL_SQL_JURNAL . " WHERE j.guru_id = ? AND j.tanggal BETWEEN ? AND ? ORDER BY j.tanggal, j.jam_mulai, p.siswa_nama",
++            'sss', [$guruId, $awal, $akhir]);
++        $cadanganNama = $rows[0]['guru_nama'] ?? '';
++        if ($cadanganNama === '') {
++            $p = pklAmbilSatu($db, "SELECT guru_nama FROM pkl_penempatan WHERE guru_id = ? LIMIT 1", 's', [$guruId]);
++            $cadanganNama = $p['guru_nama'] ?? '';
++        }
++        $guru = pklNamaGuru($db, $guruId, $cadanganNama);
++        if ($guru['nama'] === '') pklHtmlError(404, 'Guru tidak ditemukan.');
++
++        $perJenis = array_fill_keys(array_keys(PKL_JENIS), 0);
++        $siswa = [];
++        $menit = 0;
++        foreach ($rows as $r) {
++            $perJenis[$r['jenis']] = ($perJenis[$r['jenis']] ?? 0) + 1;
++            $siswa[$r['siswa_id']] = true;
++            $menit += pklMenit($r['jam_mulai'], $r['jam_selesai']);
++        }
++
++        $kop = rekapLoadKop($db);
++        [$kota, $tglTtd, $tglInput] = pklTtdKotaTanggal($kop, $berjalan ? $kini->format('Y-m-d') : $akhir);
++        $denganFoto = ($_GET['foto'] ?? '') === '1';
++        [$tahunAjaran] = activeAcademicPeriod($db);
++        $rentang = rekapAcademicMonthRange($tahunAjaran);
++
++        $e = 'rekapEsc';
++        ob_start();
++        ?>
++  <h1>Rekap Jurnal Bimbingan Praktik Kerja Lapangan</h1>
++  <table class="ident">
++    <tr><td>Guru Pembimbing</td><td>:</td><td><?= $e($guru['nama']) ?></td></tr>
++    <tr><td>NIP</td><td>:</td><td><?= $e($guru['nip'] !== '' ? $guru['nip'] : '-') ?></td></tr>
++    <tr><td>Bulan</td><td>:</td><td><?= $e(rekapBulanIndo($bulan)) ?><?= $berjalan ? ' <i>(data s.d. ' . $e(rekapTanggalIndo($kini->format('Y-m-d'))) . ')</i>' : '' ?></td></tr>
++  </table>
++
++  <h3>A. Ringkasan</h3>
++  <table class="data ringkas">
++    <tr><th>Siswa dibimbing</th><?php foreach (PKL_JENIS as $label): ?><th><?= $e($label) ?></th><?php endforeach; ?><th>Jumlah kegiatan</th><th>Total waktu</th></tr>
++    <tr>
++      <td class="c"><?= count($siswa) ?> siswa</td>
++      <?php foreach (array_keys(PKL_JENIS) as $k): ?><td class="c"><?= (int)$perJenis[$k] ?></td><?php endforeach; ?>
++      <td class="c"><?= count($rows) ?></td>
++      <td class="c"><?= $e(pklLabelDurasi($menit)) ?></td>
++    </tr>
++  </table>
++
++  <h3>B. Rincian Kegiatan Bimbingan</h3>
++  <div class="tbl-wrap">
++  <table class="data">
++    <thead><tr>
++      <th style="width:6mm">No</th><th style="width:17mm">Hari/ Tanggal</th><th style="width:12mm">Jam</th>
++      <th style="width:25mm">Siswa (Kelas)</th><th style="width:23mm">DU/DI</th><th style="width:15mm">Jenis</th>
++      <th>Uraian Kegiatan</th><th style="width:30mm">Permasalahan / Tindak Lanjut</th>
++    </tr></thead>
++    <tbody>
++    <?php if (!$rows): ?>
++      <tr><td colspan="8" class="c nihil">Nihil</td></tr>
++    <?php else: foreach ($rows as $no => $r): ?>
++      <tr>
++        <td class="c"><?= $no + 1 ?></td>
++        <td><?= $e(pklNamaHari($r['tanggal'])) ?>,<br><?= $e(pklTglPendek($r['tanggal'])) ?></td>
++        <td class="c"><?= $e($r['jam_mulai'] . '–' . $r['jam_selesai']) ?></td>
++        <td><?= $e($r['siswa_nama']) ?><br><span class="kecil"><?= $e($r['kelas_nama']) ?></span></td>
++        <td><?= $e($r['dudi_nama'] ?? '-') ?></td>
++        <td><?= $e(PKL_JENIS_PENDEK[$r['jenis']] ?? $r['jenis']) ?></td>
++        <td><?= nl2br($e($r['uraian'])) ?><?php if ($r['kondisi_siswa']): ?><br><span class="kecil">Kondisi: <?= $e($r['kondisi_siswa']) ?></span><?php endif; ?></td>
++        <td><?= $r['permasalahan'] ? $e($r['permasalahan']) : '-' ?><?php if ($r['tindak_lanjut']): ?><br><span class="kecil">TL: <?= $e($r['tindak_lanjut']) ?></span><?php endif; ?></td>
++      </tr>
++    <?php endforeach; endif; ?>
++    </tbody>
++  </table>
++  </div>
++        <?php
++        if ($denganFoto) echo pklHtmlLampiranFoto($rows);
++        $isi = ob_get_clean();
++
++        $formHtml = '<input type="hidden" name="action" value="pkl_cetak_rekap">'
++            . ($ctx['guru'] ? '' : '<input type="hidden" name="guru" value="' . $e($guruId) . '">')
++            . '<label>Bulan <input type="month" name="bulan" value="' . $e($bulan) . '" max="' . $e($bulanIni) . '"'
++            . ($rentang ? ' min="' . $e($rentang[0]) . '"' : '') . ' required></label>'
++            . '<label class="cek"><input type="checkbox" name="foto" value="1"' . ($denganFoto ? ' checked' : '') . '> Lampirkan foto</label>';
++
++        pklRenderHalaman([
++            'judul_file' => 'Rekap_Bimbingan_PKL_' . $guru['nama'] . '_' . $bulan,
++            'judul_panel'=> 'Cetak Rekap Bimbingan PKL — ' . $guru['nama'],
++            'form'       => $formHtml,
++            'kop'        => $kop,
++            'isi'        => $isi,
++            'kota'       => $kota,
++            'tgl_ttd'    => $tglTtd,
++            'tgl_input'  => $tglInput,
++            'ttd_kanan'  => ['jabatan' => 'Guru Pembimbing', 'nama' => $guru['nama'], 'nip' => $guru['nip']],
++            'pencetak'   => $ctx['nama'],
++            'kini'       => $kini,
++        ]);
++    } catch (Throwable $ex) {
++        while (ob_get_level() > 0) ob_end_clean();
++        error_log('[SIMANTAP] pkl_cetak_rekap: ' . $ex->getMessage() . ' @ ' . $ex->getFile() . ':' . $ex->getLine());
++        pklHtmlError(500, 'Gagal menyusun rekap. Coba lagi atau hubungi admin.');
++    }
++}
++
++/**
++ * GET ?action=pkl_cetak_kartu&siswa=<student_id>[&kota=&tgl_ttd=]
++ */
++function handlePklCetakKartu(mysqli $db): void
++{
++    $ctx = pklKonteksCetak($db);
++    try {
++        $sid = trim((string)($_GET['siswa'] ?? ''));
++        if ($sid === '') pklHtmlError(400, 'Pilih siswa yang kartunya akan dicetak.');
++        $penempatan = pklAmbilSemua($db, PKL_SQL_PENEMPATAN . " WHERE p.siswa_id = ? ORDER BY p.tanggal_mulai", 's', [$sid]);
++        $s = pklAmbilSatu($db, "SELECT id, name, nisn, class_id, class_name FROM students WHERE id = ?", 's', [$sid]);
++        if (!$s && !$penempatan) pklHtmlError(404, 'Siswa tidak ditemukan.');
++
++        if (!$ctx['admin'] && !$ctx['kepsek']) {
++            $boleh = false;
++            foreach ($penempatan as $p) {
++                if ($p['guru_id'] === $ctx['uid'] || pklDalamCakupanWali($ctx, $p['kelas_id'], $p['kelas_nama'])) { $boleh = true; break; }
++            }
++            if (!$boleh && $s && pklDalamCakupanWali($ctx, $s['class_id'], $s['class_name'])) $boleh = true;
++            if (!$boleh) {
++                $tulis = pklAmbilSatu($db, "SELECT COUNT(*) AS n FROM pkl_jurnal WHERE siswa_id = ? AND guru_id = ?", 'ss', [$sid, $ctx['uid']]);
++                $boleh = (int)$tulis['n'] > 0;
++            }
++            if (!$boleh) pklHtmlError(403, 'Anda hanya dapat mencetak kartu siswa bimbingan Anda atau siswa kelas perwalian Anda.');
++        }
++
++        $jurnal = pklAmbilSemua($db, PKL_SQL_JURNAL . " WHERE j.siswa_id = ? ORDER BY j.tanggal, j.jam_mulai", 's', [$sid]);
++        $akhirP = $penempatan ? $penempatan[count($penempatan) - 1] : null;
++        $pembimbing = $akhirP ? pklNamaGuru($db, $akhirP['guru_id'], $akhirP['guru_nama']) : ['nama' => '', 'nip' => ''];
++        $nama = $s['name'] ?? ($akhirP['siswa_nama'] ?? $sid);
++        $kelas = $s ? ($s['class_name'] ?: $s['class_id']) : ($akhirP['kelas_nama'] ?? '-');
++
++        $kini = new DateTimeImmutable('now');
++        $kop = rekapLoadKop($db);
++        [$kota, $tglTtd, $tglInput] = pklTtdKotaTanggal($kop, $kini->format('Y-m-d'));
++
++        $e = 'rekapEsc';
++        ob_start();
++        ?>
++  <h1>Kartu Bimbingan Praktik Kerja Lapangan</h1>
++  <table class="ident">
++    <tr><td>Nama Peserta Didik</td><td>:</td><td><?= $e($nama) ?><?= $s ? '' : ' <i>(data siswa terhapus)</i>' ?></td></tr>
++    <tr><td>NISN</td><td>:</td><td><?= $e(($s['nisn'] ?? '') ?: '-') ?></td></tr>
++    <tr><td>Kelas</td><td>:</td><td><?= $e($kelas) ?></td></tr>
++  </table>
++
++  <h3>A. Tempat dan Periode PKL</h3>
++  <div class="tbl-wrap">
++  <table class="data">
++    <thead><tr><th style="width:7mm">No</th><th>DU/DI</th><th>Alamat</th><th style="width:32mm">Pembimbing Industri</th><th style="width:32mm">Guru Pembimbing</th><th style="width:32mm">Periode</th></tr></thead>
++    <tbody>
++    <?php if (!$penempatan): ?>
++      <tr><td colspan="6" class="c nihil">Nihil</td></tr>
++    <?php else: foreach ($penempatan as $no => $p): ?>
++      <tr>
++        <td class="c"><?= $no + 1 ?></td>
++        <td><?= $e($p['dudi_nama'] ?? '-') ?><?php if (!empty($p['dudi_bidang'])): ?><br><span class="kecil"><?= $e($p['dudi_bidang']) ?></span><?php endif; ?></td>
++        <td><?= $e(($p['dudi_alamat'] ?? '') ?: '-') ?></td>
++        <td><?= $e(($p['dudi_pembimbing'] ?? '') ?: '-') ?><?php if (!empty($p['dudi_telp'])): ?><br><span class="kecil"><?= $e($p['dudi_telp']) ?></span><?php endif; ?></td>
++        <td><?= $e($p['guru_nama']) ?></td>
++        <td class="c"><?= $e(pklTglPendek($p['tanggal_mulai']) . ' – ' . pklTglPendek($p['tanggal_selesai'])) ?></td>
++      </tr>
++    <?php endforeach; endif; ?>
++    </tbody>
++  </table>
++  </div>
++
++  <h3>B. Riwayat Bimbingan</h3>
++  <div class="tbl-wrap">
++  <table class="data">
++    <thead><tr><th style="width:6mm">No</th><th style="width:17mm">Hari/ Tanggal</th><th style="width:12mm">Jam</th><th style="width:15mm">Jenis</th><th>Uraian Kegiatan</th><th style="width:32mm">Permasalahan / Tindak Lanjut</th><th style="width:24mm">Guru</th></tr></thead>
++    <tbody>
++    <?php if (!$jurnal): ?>
++      <tr><td colspan="7" class="c nihil">Nihil</td></tr>
++    <?php else: foreach ($jurnal as $no => $r): ?>
++      <tr>
++        <td class="c"><?= $no + 1 ?></td>
++        <td><?= $e(pklNamaHari($r['tanggal'])) ?>,<br><?= $e(pklTglPendek($r['tanggal'])) ?></td>
++        <td class="c"><?= $e($r['jam_mulai'] . '–' . $r['jam_selesai']) ?></td>
++        <td><?= $e(PKL_JENIS_PENDEK[$r['jenis']] ?? $r['jenis']) ?></td>
++        <td><?= nl2br($e($r['uraian'])) ?><?php if ($r['kondisi_siswa']): ?><br><span class="kecil">Kondisi: <?= $e($r['kondisi_siswa']) ?></span><?php endif; ?></td>
++        <td><?= $r['permasalahan'] ? $e($r['permasalahan']) : '-' ?><?php if ($r['tindak_lanjut']): ?><br><span class="kecil">TL: <?= $e($r['tindak_lanjut']) ?></span><?php endif; ?></td>
++        <td><?= $e($r['guru_nama']) ?></td>
++      </tr>
++    <?php endforeach; endif; ?>
++    </tbody>
++  </table>
++  </div>
++        <?php
++        $isi = ob_get_clean();
++
++        pklRenderHalaman([
++            'judul_file' => 'Kartu_Bimbingan_PKL_' . $nama,
++            'judul_panel'=> 'Cetak Kartu Bimbingan PKL — ' . $nama,
++            'form'       => '<input type="hidden" name="action" value="pkl_cetak_kartu"><input type="hidden" name="siswa" value="' . $e($sid) . '">',
++            'kop'        => $kop,
++            'isi'        => $isi,
++            'kota'       => $kota,
++            'tgl_ttd'    => $tglTtd,
++            'tgl_input'  => $tglInput,
++            'ttd_kanan'  => ['jabatan' => 'Guru Pembimbing', 'nama' => $pembimbing['nama'], 'nip' => $pembimbing['nip']],
++            'pencetak'   => $ctx['nama'],
++            'kini'       => $kini,
++        ]);
++    } catch (Throwable $ex) {
++        while (ob_get_level() > 0) ob_end_clean();
++        error_log('[SIMANTAP] pkl_cetak_kartu: ' . $ex->getMessage() . ' @ ' . $ex->getFile() . ':' . $ex->getLine());
++        pklHtmlError(500, 'Gagal menyusun kartu bimbingan. Coba lagi atau hubungi admin.');
++    }
++}
++
++function pklHtmlLampiranFoto(array $rows): string
++{
++    $e = 'rekapEsc';
++    $kotak = '';
++    foreach ($rows as $r) {
++        foreach (pklFotoDecode($r['foto_json']) as $f) {
++            if (!preg_match(PKL_POLA_FOTO, $f)) continue;
++            $kotak .= '<figure><img src="' . $e(rekapAssetUrl($f)) . '" alt="" onerror="this.style.visibility=\'hidden\'">'
++                . '<figcaption>' . $e(pklTglPendek($r['tanggal']) . ' · ' . $r['siswa_nama']) . '</figcaption></figure>';
++        }
++    }
++    return '<h3>Lampiran Foto Kegiatan</h3>' . ($kotak === '' ? '<p class="nihil">Tidak ada foto.</p>' : '<div class="foto">' . $kotak . '</div>');
++}
++
++/**
++ * Kerangka halaman cetak: panel isian (no-print), kop, isi, tanda tangan, catatan cetak.
++ */
++function pklRenderHalaman(array $c): void
++{
++    $e = 'rekapEsc';
++    $kop = $c['kop'];
++    $logoKiri  = rekapAssetUrl($kop['kop_logo_kiri'] ?? '');
++    $logoKanan = rekapAssetUrl($kop['kop_logo_kanan'] ?? '');
++    $kontak = [];
++    if (($kop['kop_telp'] ?? '') !== '')    $kontak[] = 'Telp. ' . $kop['kop_telp'];
++    if (($kop['kop_email'] ?? '') !== '')   $kontak[] = 'Email: ' . $kop['kop_email'];
++    if (($kop['kop_website'] ?? '') !== '') $kontak[] = 'Website: ' . $kop['kop_website'];
++    $kopKosong = ($kop['kop_sekolah'] ?? '') === '' && ($kop['kop_instansi'] ?? '') === '' && ($kop['kop_dinas'] ?? '') === '';
++    $kepsekNama = $kop['kop_kepsek_nama'] ?? '';
++    $kepsekNip  = $kop['kop_kepsek_nip'] ?? '';
++    $kanan = $c['ttd_kanan'];
++    $titik = '(.......................................)';
++    $judulFile = preg_replace('/[^A-Za-z0-9_-]/', '_', $c['judul_file']);
++    $tz = function_exists('rekapTimezoneLabel') ? rekapTimezoneLabel() : '';
++
++    rekapSendHeaders(200);
++    ?>
++<!doctype html>
++<html lang="id">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title><?= $e($judulFile) ?></title>
++<style>
++  @page { size: A4 portrait; margin: 15mm 15mm 15mm 20mm; }
++  * { box-sizing: border-box; }
++  body { margin: 0; background: #e2e8f0; color: #000; font-family: Arial, Helvetica, sans-serif; font-size: 10pt; }
++  .panel { max-width: 210mm; margin: 16px auto 0; background: #fff; border: 1px solid #cbd5e1; border-radius: 12px; padding: 16px; font-size: 13px; color: #0f172a; }
++  .panel h2 { margin: 0 0 10px; font-size: 16px; }
++  .panel form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
++  .panel label { display: flex; flex-direction: column; gap: 4px; font-weight: bold; font-size: 12px; }
++  .panel label.cek { flex-direction: row; align-items: center; padding-bottom: 8px; }
++  .panel input { padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px; min-width: 0; }
++  .panel .btn { padding: 8px 14px; border-radius: 8px; border: 1px solid #cbd5e1; background: #fff; font-weight: bold; cursor: pointer; font-size: 13px; }
++  .panel .btn-primary { background: #059669; border-color: #059669; color: #fff; }
++  .panel .hint { margin: 10px 0 0; color: #475569; line-height: 1.5; }
++  .panel .notice { margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; background: #fef3c7; color: #78350f; }
++  .sheet { width: 210mm; min-height: 297mm; margin: 16px auto; padding: 15mm 15mm 15mm 20mm; background: #fff; box-shadow: 0 4px 16px rgba(15, 23, 42, .15); }
++  .kop { width: 100%; border-collapse: collapse; }
++  .kop td { border: 0; padding: 0; vertical-align: middle; }
++  .kop .logo { width: 24mm; text-align: center; }
++  .kop .logo img { max-width: 22mm; max-height: 24mm; }
++  .kop .teks { text-align: center; line-height: 1.25; }
++  .kop .instansi, .kop .dinas { font-size: 12pt; font-weight: bold; text-transform: uppercase; }
++  .kop .sekolah { font-size: 15pt; font-weight: bold; text-transform: uppercase; }
++  .kop .alamat { font-size: 9pt; }
++  .kop-line { border-top: 3px solid #000; border-bottom: 1px solid #000; height: 4px; margin: 6px 0 12px; }
++  h1 { font-size: 11.5pt; text-align: center; margin: 0 0 10px; text-transform: uppercase; }
++  h3 { font-size: 10pt; margin: 14px 0 6px; break-after: avoid; page-break-after: avoid; }
++  .ident { border-collapse: collapse; margin-bottom: 4px; }
++  .ident td { border: 0; padding: 1px 6px 1px 0; font-size: 10pt; vertical-align: top; }
++  .tbl-wrap { overflow-x: auto; }
++  table.data { width: 100%; border-collapse: collapse; }
++  table.data th, table.data td { border: 1px solid #000; padding: 2px 4px; font-size: 8.5pt; vertical-align: top; }
++  table.data th { background: #e5e7eb; text-align: center; vertical-align: middle; }
++  table.data .c { text-align: center; }
++  table.ringkas td, table.ringkas th { font-size: 9pt; }
++  .nihil { font-style: italic; }
++  .kecil { font-size: 7.5pt; color: #333; }
++  thead { display: table-header-group; }
++  tr { page-break-inside: avoid; break-inside: avoid; }
++  .foto { display: flex; flex-wrap: wrap; gap: 6px; }
++  .foto figure { margin: 0; width: 55mm; page-break-inside: avoid; break-inside: avoid; }
++  .foto img { width: 55mm; height: 40mm; object-fit: cover; border: 1px solid #999; }
++  .foto figcaption { font-size: 7.5pt; }
++  .ttd { width: 100%; margin-top: 18px; border-collapse: collapse; page-break-inside: avoid; break-inside: avoid; }
++  .ttd td { border: 0; width: 50%; text-align: center; vertical-align: top; font-size: 10pt; padding: 0 8px; }
++  .ttd .space { height: 20mm; }
++  .ttd .nama { font-weight: bold; text-decoration: underline; }
++  .footer { margin-top: 14px; font-size: 7.5pt; color: #444; }
++  @media screen and (max-width: 840px) {
++    .panel { margin: 12px 16px 0; }
++    .sheet { width: auto; min-height: 0; margin: 12px 16px; padding: 16px; }
++  }
++  @media print {
++    body { background: #fff; }
++    .no-print { display: none !important; }
++    .sheet { width: auto; min-height: 0; margin: 0; padding: 0; box-shadow: none; }
++    .tbl-wrap { overflow: visible; }
++    table.data th { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
++  }
++</style>
++</head>
++<body>
++<div class="panel no-print">
++  <h2><?= $e($c['judul_panel']) ?></h2>
++  <form method="get" action="index.php">
++    <?= $c['form'] ?>
++    <label>Kota <input type="text" name="kota" maxlength="50" value="<?= $e($c['kota']) ?>" placeholder="mis. Banjarbaru"></label>
++    <label>Tanggal tanda tangan <input type="date" name="tgl_ttd" value="<?= $e($c['tgl_input']) ?>"></label>
++    <button type="submit" class="btn">Terapkan</button>
++    <button type="button" class="btn btn-primary" onclick="window.print()">Cetak / Simpan PDF</button>
++  </form>
++  <p class="hint">Pada dialog cetak, pilih tujuan <b>Simpan sebagai PDF</b>, ukuran kertas <b>A4</b>, dan matikan opsi <b>Header dan footer</b>.
++    Kosongkan tanggal untuk memakai default (<?= $e(rekapTanggalIndo($c['tgl_ttd'])) ?>).</p>
++  <?php if ($kopKosong): ?><p class="notice">Kop sekolah belum diatur. Minta Admin mengisi Pengaturan Kop Surat.</p><?php endif; ?>
++</div>
++
++<div class="sheet">
++  <table class="kop">
++    <tr>
++      <td class="logo"><?php if ($logoKiri !== ''): ?><img src="<?= $e($logoKiri) ?>" alt="" onerror="this.style.visibility='hidden'"><?php endif; ?></td>
++      <td class="teks">
++        <?php if (($kop['kop_instansi'] ?? '') !== ''): ?><div class="instansi"><?= $e($kop['kop_instansi']) ?></div><?php endif; ?>
++        <?php if (($kop['kop_dinas'] ?? '') !== ''): ?><div class="dinas"><?= $e($kop['kop_dinas']) ?></div><?php endif; ?>
++        <?php if (($kop['kop_sekolah'] ?? '') !== ''): ?><div class="sekolah"><?= $e($kop['kop_sekolah']) ?></div><?php endif; ?>
++        <?php if (($kop['kop_alamat'] ?? '') !== ''): ?><div class="alamat"><?= $e($kop['kop_alamat']) ?></div><?php endif; ?>
++        <?php if ($kontak): ?><div class="alamat"><?= $e(implode(' · ', $kontak)) ?></div><?php endif; ?>
++      </td>
++      <td class="logo"><?php if ($logoKanan !== ''): ?><img src="<?= $e($logoKanan) ?>" alt="" onerror="this.style.visibility='hidden'"><?php endif; ?></td>
++    </tr>
++  </table>
++  <div class="kop-line"></div>
++
++  <?= $c['isi'] ?>
++
++  <table class="ttd">
++    <tr><td>&nbsp;</td><td><?= $e(($c['kota'] !== '' ? $c['kota'] . ', ' : '') . rekapTanggalIndo($c['tgl_ttd'])) ?></td></tr>
++    <tr><td>Mengetahui,<br>Kepala Sekolah</td><td><br><?= $e($kanan['jabatan']) ?></td></tr>
++    <tr><td class="space"></td><td class="space"></td></tr>
++    <tr>
++      <td><?= $kepsekNama !== '' ? '<span class="nama">' . $e($kepsekNama) . '</span>' : $titik ?>
++        <?php if ($kepsekNip !== ''): ?><br>NIP. <?= $e($kepsekNip) ?><?php endif; ?></td>
++      <td><?= $kanan['nama'] !== '' ? '<span class="nama">' . $e($kanan['nama']) . '</span>' : $titik ?>
++        <?php if ($kanan['nip'] !== ''): ?><br>NIP. <?= $e($kanan['nip']) ?><?php endif; ?></td>
++    </tr>
++  </table>
++
++  <p class="footer">Dicetak dari SIMANTAP pada <?= $e(rekapTanggalIndo($c['kini']->format('Y-m-d')) . ' ' . $c['kini']->format('H:i') . ($tz !== '' ? ' ' . $tz : '')) ?> oleh <?= $e($c['pencetak']) ?>.
++    Jurnal bimbingan dapat diubah guru setelah dokumen ini dicetak.</p>
++</div>
++</body>
++</html>
++<?php
++    exit;
++}
+diff --git a/api/index.php b/api/index.php
+index 5e4da4f..d119c06 100644
+--- a/api/index.php
++++ b/api/index.php
+@@ -48,6 +48,7 @@ require_once __DIR__ . '/label_media.php';
+ require_once __DIR__ . '/portal_nilai.php';
+ require_once __DIR__ . '/persetujuan_jurnal.php';
+ require_once __DIR__ . '/kelola_guru.php';
++require_once __DIR__ . '/bimbingan_pkl.php';
+ 
+ $action = $_GET['action'] ?? '';
+ 
+@@ -2383,6 +2384,71 @@ switch ($action) {
+         jadwalKbmSave($db);
+         break;
+ 
++    // --- JURNAL BIMBINGAN PKL (docs/specs/jurnal-bimbingan-pkl.md) ---
++    case 'pkl_konteks':
++        handlePklKonteks($db);
++        break;
++
++    case 'pkl_dudi_list':
++        handlePklDudiList($db);
++        break;
++
++    case 'pkl_dudi_simpan':
++        handlePklDudiSimpan($db);
++        break;
++
++    case 'pkl_dudi_hapus':
++        handlePklDudiHapus($db);
++        break;
++
++    case 'pkl_kandidat_siswa':
++        handlePklKandidatSiswa($db);
++        break;
++
++    case 'pkl_penempatan_list':
++        handlePklPenempatanList($db);
++        break;
++
++    case 'pkl_penempatan_simpan':
++        handlePklPenempatanSimpan($db);
++        break;
++
++    case 'pkl_penempatan_tutup':
++        handlePklPenempatanTutup($db);
++        break;
++
++    case 'pkl_penempatan_alih':
++        handlePklPenempatanAlih($db);
++        break;
++
++    case 'pkl_penempatan_hapus':
++        handlePklPenempatanHapus($db);
++        break;
++
++    case 'pkl_jurnal_list':
++        handlePklJurnalList($db);
++        break;
++
++    case 'pkl_jurnal_simpan':
++        handlePklJurnalSimpan($db);
++        break;
++
++    case 'pkl_jurnal_hapus':
++        handlePklJurnalHapus($db);
++        break;
++
++    case 'pkl_unggah_foto':
++        handlePklUnggahFoto($db);
++        break;
++
++    case 'pkl_cetak_rekap':
++        handlePklCetakRekap($db);
++        break;
++
++    case 'pkl_cetak_kartu':
++        handlePklCetakKartu($db);
++        break;
++
+     default:
+ 
+         $handled = require __DIR__ . '/endpoints_v2.php';

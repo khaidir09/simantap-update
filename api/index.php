@@ -48,6 +48,7 @@ require_once __DIR__ . '/label_media.php';
 require_once __DIR__ . '/portal_nilai.php';
 require_once __DIR__ . '/persetujuan_jurnal.php';
 require_once __DIR__ . '/kelola_guru.php';
+require_once __DIR__ . '/bimbingan_pkl.php';
 
 $action = $_GET['action'] ?? '';
 
@@ -2381,6 +2382,71 @@ switch ($action) {
 
     case 'jadwal_kbm_save':
         jadwalKbmSave($db);
+        break;
+
+    // --- JURNAL BIMBINGAN PKL (docs/specs/jurnal-bimbingan-pkl.md) ---
+    case 'pkl_konteks':
+        handlePklKonteks($db);
+        break;
+
+    case 'pkl_dudi_list':
+        handlePklDudiList($db);
+        break;
+
+    case 'pkl_dudi_simpan':
+        handlePklDudiSimpan($db);
+        break;
+
+    case 'pkl_dudi_hapus':
+        handlePklDudiHapus($db);
+        break;
+
+    case 'pkl_kandidat_siswa':
+        handlePklKandidatSiswa($db);
+        break;
+
+    case 'pkl_penempatan_list':
+        handlePklPenempatanList($db);
+        break;
+
+    case 'pkl_penempatan_simpan':
+        handlePklPenempatanSimpan($db);
+        break;
+
+    case 'pkl_penempatan_tutup':
+        handlePklPenempatanTutup($db);
+        break;
+
+    case 'pkl_penempatan_alih':
+        handlePklPenempatanAlih($db);
+        break;
+
+    case 'pkl_penempatan_hapus':
+        handlePklPenempatanHapus($db);
+        break;
+
+    case 'pkl_jurnal_list':
+        handlePklJurnalList($db);
+        break;
+
+    case 'pkl_jurnal_simpan':
+        handlePklJurnalSimpan($db);
+        break;
+
+    case 'pkl_jurnal_hapus':
+        handlePklJurnalHapus($db);
+        break;
+
+    case 'pkl_unggah_foto':
+        handlePklUnggahFoto($db);
+        break;
+
+    case 'pkl_cetak_rekap':
+        handlePklCetakRekap($db);
+        break;
+
+    case 'pkl_cetak_kartu':
+        handlePklCetakKartu($db);
         break;
 
     default:

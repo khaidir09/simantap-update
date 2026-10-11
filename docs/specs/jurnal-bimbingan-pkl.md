@@ -136,6 +136,21 @@ Guru dengan `class_homeroom` yang tingkatnya XII melihat tab **Siswa PKL Kelas S
 - Tabel semua jurnal bimbingan siswa itu secara kronologis (lintas penempatan).
 - TTD: "Mengetahui, Kepala Sekolah" dan "Guru Pembimbing" (pembimbing penempatan terakhir).
 
+### 3.7 Salin jurnal ke siswa lain di DU/DI yang sama (iterasi 2, 2026-10-11)
+
+Satu kunjungan ke DU/DI biasanya mencakup beberapa siswa. Agar guru tidak mengetik ulang isian yang sama:
+- **Saat menambah jurnal:** setelah memilih siswa, form menampilkan daftar centang "Salin juga ke siswa lain di DU/DI yang sama".
+  Daftar berisi penempatan **milik guru itu** di **DU/DI yang sama** yang periodenya mencakup tanggal jurnal. Tombol "Pilih semua" tersedia.
+- **Dari jurnal yang sudah ada:** tombol "Salin ke siswa lain" pada kartu jurnal (hanya jurnal milik sendiri) membuka form berisi isian jurnal itu
+  (tanggal, jam, jenis, uraian, kondisi, permasalahan, tindak lanjut, foto), dengan daftar centang siswa lain di DU/DI yang sama. Isian masih bisa diubah sebelum disimpan.
+- Hasilnya **jurnal terpisah per siswa** (satu baris `pkl_jurnal` per penempatan), sehingga kartu siswa dan rekap tetap per siswa.
+  Setelah disimpan, tiap jurnal diubah/dihapus sendiri-sendiri; tidak ada kaitan antar-salinan.
+- Foto dipakai bersama (path yang sama). File baru dihapus bila tidak dipakai jurnal mana pun (`pklHapusFotoYatim` sudah menghitung pemakaian).
+- Disimpan **semua atau tidak sama sekali** (transaksi). Bila satu tujuan tidak valid, tidak ada jurnal yang tersimpan.
+- **Jurnal ganda** ditolak 409: satu penempatan tidak boleh punya dua jurnal dengan tanggal dan jam mulai yang sama. Aturan ini berlaku untuk semua
+  penyimpanan jurnal (baru maupun ubah), bukan hanya salin, supaya salin dua kali tidak menghasilkan duplikat.
+- Salin hanya saat menambah jurnal. `salin_ke` pada permintaan ubah ditolak 400. Maksimal 50 siswa sekali salin.
+
 ## 4. Role dan otorisasi
 
 Semua pemeriksaan dilakukan di backend. Role dan perwalian dibaca ulang dari DB lewat `loadFreshUser()`, bukan hanya dari sesi. Aktor selalu `$_SESSION['user']['uid']`, tidak pernah dari body. Action mutasi wajib `POST` (405 bila bukan).
@@ -266,7 +281,7 @@ File baru **`api/bimbingan_pkl.php`** (guard `if (!defined('SIMANTAP_API')) exit
 | `pkl_penempatan_alih` | POST | `{id, guru_id_baru, tanggal_alih}` | `{success, lama, baru}`. Hanya ADMIN; satu transaksi |
 | `pkl_penempatan_hapus` | POST | `{id}` | `{success}`; 409 bila punya jurnal |
 | `pkl_jurnal_list` | GET | `bulan?` (YYYY-MM), `penempatan_id?`, `siswa?`, `guru?` | `{items:[...]}`, urut tanggal desc lalu jam_mulai desc |
-| `pkl_jurnal_simpan` | POST | `{id?, penempatan_id, tanggal, jam_mulai, jam_selesai, jenis, uraian, kondisi_siswa?, permasalahan?, tindak_lanjut?, foto?[]}` | `{success, item}` |
+| `pkl_jurnal_simpan` | POST | `{id?, penempatan_id, tanggal, jam_mulai, jam_selesai, jenis, uraian, kondisi_siswa?, permasalahan?, tindak_lanjut?, foto?[], salin_ke?[]}` | `{success, item, jumlah, ids?}` (§3.7) |
 | `pkl_jurnal_hapus` | POST | `{id}` | `{success}` |
 | `pkl_unggah_foto` | POST multipart | `file` | `{success, path}`. JPG/PNG/WEBP via `finfo`, ≤ 2 MB, ekstensi dari server, nama `random_bytes(16)`, folder `uploads/journals/pkl/<Ym>/` + `index.html` |
 | `pkl_cetak_rekap` | GET | `guru?` (default diri sendiri), `bulan`, `kota?`, `tgl_ttd?`, `foto?` | Halaman HTML A4 (bukan JSON). Error berupa halaman HTML (`rekapHtmlError`) |
@@ -341,7 +356,8 @@ Patch `docs/patches/apply-bimbingan-pkl-bundle.js` membaca `assets/index-CGWL69P
 - Peta lokasi/GPS, verifikasi foto kunjungan, dan surat tugas kunjungan.
 - PKL untuk tingkat selain XII.
 - Kolom/isian **kehadiran siswa** di jurnal bimbingan. Presensi harian siswa PKL adalah ranah tempat PKL, yang sudah menyediakan lembar presensi harian.
-- **Salin jurnal ke siswa lain di DU/DI yang sama** (satu kunjungan → beberapa siswa sekaligus). Dicatat sebagai iterasi berikutnya. Rancangan tabel sekarang tidak menghalanginya, karena fitur itu cukup membuat beberapa baris `pkl_jurnal` sekaligus.
+- ~~Salin jurnal ke siswa lain di DU/DI yang sama~~: sudah diimplementasikan pada iterasi 2 (§3.7).
+- Salin jurnal ke siswa di DU/DI lain atau ke siswa bimbingan guru lain, dan pengubahan massal jurnal hasil salin.
 - Pembersihan otomatis file foto yatim.
 - Perbaikan celah keamanan lama di modul lain (tercatat di CLAUDE.md).
 
@@ -384,6 +400,9 @@ Patch `docs/patches/apply-bimbingan-pkl-bundle.js` membaca `assets/index-CGWL69P
 16. Action mutasi yang dipanggil dengan GET mengembalikan 405.
 17. Halaman Jurnal Mengajar, statistik jurnal, persetujuan jurnal, dan Pusat Analisis berperilaku sama seperti sebelum patch.
 18. `php -l` lolos untuk semua file PHP yang berubah. Patch bundle bisa dijalankan ulang dari bundle acuan dan gagal keras bila anchor tidak cocok.
+19. (Iterasi 2) Jurnal baru dengan `salin_ke` membuat satu jurnal per siswa terpilih dengan isian sama. Tujuan harus milik guru yang sama, di DU/DI
+    yang sama, dan periodenya mencakup tanggal; bila tidak, tidak ada jurnal yang tersimpan (403/400). Jurnal ganda (penempatan, tanggal, jam mulai) → 409.
+    Jurnal hasil salin bisa diubah sendiri-sendiri.
 
 ## 13. Verifikasi end-to-end
 
@@ -419,6 +438,9 @@ Skrip login per role (cookie terpisah) dan memeriksa minimal:
 13. Kepsek: list semua → 200. Mutasi apa pun → 403.
 14. `pkl_cetak_rekap` Guru A bulan ini → 200 `text/html` berisi nama siswa dan "Mengetahui". Guru B dengan `guru=<A>` → 403. Bulan tanpa data → berisi "Nihil".
 15. `pkl_cetak_kartu` siswa 1 → memuat dua penempatan (Guru A dan Guru B).
+16. (Iterasi 2, grup S) Guru A: jurnal siswa 2 dengan `salin_ke=[siswa 1, siswa 2, siswa 1]` → 200, `jumlah=2`. Ulangi tanpa salin → 409.
+    Salah satu tujuan ganda → 409 dan jumlah jurnal tidak berubah. Tujuan milik Guru B → 403. Tujuan di DU/DI lain atau di luar periode → 400.
+    `salin_ke` saat ubah → 400. Ubah satu jurnal hasil salin tidak mengubah salinan lain.
 
 Setelah selesai, jalankan `uji-bimbingan-pkl-cleanup.sql`. Cleanup menghapus data uji, tabel `pkl_*` bila dibuat oleh uji, dan file `uploads/journals/pkl/` hasil uji.
 
@@ -429,6 +451,8 @@ Setelah selesai, jalankan `uji-bimbingan-pkl-cleanup.sql`. Cleanup menghapus dat
 3. Login sebagai wali kelas XII: tab Siswa PKL Kelas Saya hanya baca.
 4. Login sebagai Kepala Sekolah: tab Pantau, filter, cetak rekap guru lain. Tidak ada tombol mutasi.
 5. Login sebagai ADMIN: kelola DU/DI, alih pembimbing, hapus jurnal.
+5a. (Iterasi 2) Sebagai guru dengan 3 siswa di satu DU/DI: "Salin ke siswa lain" pada jurnal siswa 1 → centang "Pilih semua" → tombol
+    "Simpan Jurnal (2 siswa)" → pesan "tersimpan untuk 2 siswa". "Tambah Jurnal" lalu pilih siswa → daftar centang tidak memuat siswa itu sendiri.
 6. Regresi: buat dan simpan satu Jurnal Mengajar biasa, buka statistik jurnal, persetujuan jurnal bulanan, dan Dashboard Kelas Saya. Semua harus tetap berfungsi. Tidak ada error di konsol browser.
 
 ## 14. Risiko dan trade-off
@@ -443,6 +467,6 @@ Setelah selesai, jalankan `uji-bimbingan-pkl-cleanup.sql`. Cleanup menghapus dat
 | Tabel dibuat saat runtime (DDL di request) → pola yang sama dengan modul lain, tetapi user DB butuh hak CREATE | Sama seperti `student_dispensations` dan `journal_media_labels`. Usulan upstream memindahkannya ke migrasi |
 | `uploads/` tanpa `.htaccess` | Ekstensi ditentukan server dari MIME dan nama acak, sehingga file `.php` tidak bisa terbentuk |
 | Auto-updater menimpa `api/index.php`/`app.html` | Ikut paket usulan upstream. Dokumen patch berisi langkah pasang ulang |
-| Satu entri per siswa → guru yang mengunjungi DU/DI berisi 5 siswa harus mengisi 5 jurnal | Keputusan wawancara (data per siswa lebih rapi untuk kartu siswa). Fitur "salin jurnal ke siswa lain di DU/DI yang sama" dicatat sebagai iterasi berikutnya (§10) |
+| Satu entri per siswa → guru yang mengunjungi DU/DI berisi 5 siswa harus mengisi 5 jurnal | Keputusan wawancara (data per siswa lebih rapi untuk kartu siswa). Diatasi pada iterasi 2 dengan "salin jurnal ke siswa lain di DU/DI yang sama" (§3.7) |
 | Syarat pembimbing bergantung pada kelengkapan `teacher_subjects` → guru yang benar-benar membimbing tetapi penugasan mapelnya belum diisi akan ditolak | Pesan 403 mengarahkan guru mengisi penugasan mapel di Profil (fitur penugasan mapel mandiri), lalu mencoba lagi |
 | Terpisah dari statistik jurnal mengajar → dashboard Kepsek tidak menunjukkan aktivitas guru selama PKL | Disengaja untuk menghindari regresi. Tab Pantau menjadi tempat pemantauan |

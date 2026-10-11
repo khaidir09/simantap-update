@@ -3592,7 +3592,7 @@ Tindakan ini juga akan mencabut akses mereka dan menghapus data penugasan mapel 
       + (p.jurnal_terakhir ? ` · terakhir ${__pklTgl(p.jurnal_terakhir)}` : '')
       + (tampilGuru ? ` · Pembimbing: ${p.guru_nama}` : '')),
     children && h('div', { className: K.barKiri }, children));
-}function __pklDaftarJurnal({ items, onUbah, onHapus, tampilGuru, kosong }) {
+}function __pklDaftarJurnal({ items, onUbah, onSalin, onHapus, tampilGuru, kosong }) {
   const K = __pklK;
   const h = __pklH;
   if (!items.length) return h('p', { className: K.kosong }, kosong || 'Belum ada jurnal bimbingan.');
@@ -3609,8 +3609,9 @@ Tindakan ini juga akan mencabut akses mereka dan menghapus data penugasan mapel 
     j.foto && j.foto.length > 0 && h('div', { className: K.fotoWrap }, j.foto.map((f) => h('a', { key: f, href: f, target: '_blank', rel: 'noopener noreferrer' },
       h('img', { src: f, alt: 'Foto bimbingan', className: K.foto })))),
     tampilGuru && h('p', { className: K.teksKecil }, `Ditulis oleh ${j.guru_nama}`),
-    ((onUbah && j.bisa_ubah) || (onHapus && j.bisa_hapus)) && h('div', { className: K.barKiri },
+    ((onUbah && j.bisa_ubah) || (onSalin && j.milik) || (onHapus && j.bisa_hapus)) && h('div', { className: K.barKiri },
       onUbah && j.bisa_ubah && h('button', { onClick: () => onUbah(j), className: K.btnKecil }, 'Ubah'),
+      onSalin && j.milik && h('button', { onClick: () => onSalin(j), className: K.btnKecil }, 'Salin ke siswa lain'),
       onHapus && j.bisa_hapus && h('button', { onClick: () => onHapus(j), className: K.btnMerah }, 'Hapus')))));
 }function __pklJurnalPenempatan({ p, bolehHapus }) {
   const K = __pklK;
@@ -3867,10 +3868,13 @@ Tindakan ini juga akan mencabut akses mereka dan menghapus data penugasan mapel 
   const h = __pklH;
   const hariIni = __pklIso(new Date());
   const edit = !!(awal && awal.id);
+  // Mode salin: isian diambil dari jurnal yang sudah ada, siswa tujuan dipilih lewat daftar centang
+  const asal = (!edit && awal && awal.salinDari) || null;
   const [f, setF] = ue.useState(() => ({
     tanggal: hariIni, penempatan_id: '', jam_mulai: '', jam_selesai: '', jenis: 'KUNJUNGAN',
     uraian: '', kondisi_siswa: '', permasalahan: '', tindak_lanjut: '', foto: [], ...(awal || {}),
   }));
+  const [salin, setSalin] = ue.useState({});
   const [proses, setProses] = ue.useState(false);
   const [unggah, setUnggah] = ue.useState(false);
   const [galat, setGalat] = ue.useState('');
@@ -3878,6 +3882,12 @@ Tindakan ini juga akan mencabut akses mereka dan menghapus data penugasan mapel 
   const cocok = penempatan.filter((p) => p.tanggal_mulai <= f.tanggal && p.tanggal_selesai >= f.tanggal);
   const pilihan = edit ? penempatan.filter((p) => p.id === f.penempatan_id) : cocok;
   const dipilih = penempatan.find((p) => p.id === f.penempatan_id);
+  // Siswa lain milik guru ini di DU/DI yang sama, dengan periode yang mencakup tanggal jurnal
+  const dudiAcuan = asal ? asal.dudi_id : (dipilih ? dipilih.dudi_id : '');
+  const kecuali = asal ? asal.penempatan_id : f.penempatan_id;
+  const serumpun = edit || !dudiAcuan ? [] : cocok.filter((p) => p.dudi_id === dudiAcuan && p.id !== kecuali);
+  const tujuanSalin = serumpun.filter((p) => salin[p.id]).map((p) => p.id);
+  const semuaDipilih = serumpun.length > 0 && tujuanSalin.length === serumpun.length;
 
   const pilihFoto = async (e) => {
     const berkas = e.target.files && e.target.files[0];
@@ -3902,38 +3912,57 @@ Tindakan ini juga akan mencabut akses mereka dan menghapus data penugasan mapel 
     setProses(true);
     setGalat('');
     try {
-      await __pklPost('pkl_jurnal_simpan', {
-        id: edit ? f.id : '', penempatan_id: f.penempatan_id, tanggal: f.tanggal, jam_mulai: f.jam_mulai, jam_selesai: f.jam_selesai,
+      const utama = asal ? tujuanSalin[0] : f.penempatan_id;
+      const r = await __pklPost('pkl_jurnal_simpan', {
+        id: edit ? f.id : '', penempatan_id: utama, tanggal: f.tanggal, jam_mulai: f.jam_mulai, jam_selesai: f.jam_selesai,
         jenis: f.jenis, uraian: f.uraian, kondisi_siswa: f.kondisi_siswa, permasalahan: f.permasalahan, tindak_lanjut: f.tindak_lanjut, foto: f.foto || [],
+        salin_ke: edit ? [] : tujuanSalin.filter((id) => id !== utama),
       });
-      onSelesai(edit ? 'Jurnal bimbingan diperbarui.' : 'Jurnal bimbingan tersimpan.', f.tanggal);
+      const n = (r && r.jumlah) || 1;
+      onSelesai(edit ? 'Jurnal bimbingan diperbarui.' : (n > 1 ? `Jurnal bimbingan tersimpan untuk ${n} siswa.` : 'Jurnal bimbingan tersimpan.'), f.tanggal);
     } catch (e) {
       setGalat(e.message);
     } finally {
       setProses(false);
     }
   };
-  const ok = !proses && !unggah && f.penempatan_id && f.tanggal && f.jam_mulai && f.jam_selesai && String(f.uraian).trim();
+  const ok = !proses && !unggah && (asal ? tujuanSalin.length > 0 : f.penempatan_id) && f.tanggal && f.jam_mulai && f.jam_selesai && String(f.uraian).trim();
+  const jumlahSimpan = (asal ? 0 : 1) + tujuanSalin.length;
   const teks = (k, label, maks, baris) => __pklField(label, h('textarea', {
     className: K.textarea, rows: baris || 2, maxLength: maks, value: f[k] || '', onChange: (e) => ubah(k, e.target.value),
   }), true);
 
   return h('div', { className: K.card },
     h('div', { className: K.cardHead },
-      h('p', { className: K.subjudul }, edit ? 'Ubah Jurnal Bimbingan' : 'Tambah Jurnal Bimbingan'),
+      h('p', { className: K.subjudul }, edit ? 'Ubah Jurnal Bimbingan' : asal ? `Salin Jurnal ${asal.siswa_nama || ''}` : 'Tambah Jurnal Bimbingan'),
       h('button', { onClick: onBatal, className: K.btnPutih }, 'Tutup')),
     h('div', { className: K.cardBody },
       h(__pklGalat, { pesan: galat }),
       h('div', { className: K.grid2 },
         __pklField('Tanggal', h('input', { type: 'date', className: K.input, value: f.tanggal, max: hariIni, onChange: (e) => ubah('tanggal', e.target.value) })),
-        __pklField('Siswa bimbingan', h('select', {
-          className: K.select, value: f.penempatan_id, disabled: edit, onChange: (e) => ubah('penempatan_id', e.target.value),
-        },
-        h('option', { value: '' }, pilihan.length ? '-- Pilih siswa --' : 'Tidak ada siswa bimbingan pada tanggal ini'),
-        pilihan.map((p) => h('option', { key: p.id, value: p.id }, `${p.siswa_nama} (${p.kelas_nama})`)))),
+        asal ? __pklField('Disalin dari', h('p', { className: K.teks }, `${asal.siswa_nama || '-'} · ${__pklTgl(asal.tanggal)} ${asal.jam_mulai}–${asal.jam_selesai}`))
+          : __pklField('Siswa bimbingan', h('select', {
+            className: K.select, value: f.penempatan_id, disabled: edit, onChange: (e) => ubah('penempatan_id', e.target.value),
+          },
+          h('option', { value: '' }, pilihan.length ? '-- Pilih siswa --' : 'Tidak ada siswa bimbingan pada tanggal ini'),
+          pilihan.map((p) => h('option', { key: p.id, value: p.id }, `${p.siswa_nama} (${p.kelas_nama})`)))),
         __pklField('Jam mulai', h('input', { type: 'time', className: K.input, value: f.jam_mulai, onChange: (e) => ubah('jam_mulai', e.target.value) })),
         __pklField('Jam selesai', h('input', { type: 'time', className: K.input, value: f.jam_selesai, onChange: (e) => ubah('jam_selesai', e.target.value) })),
-        __pklField('DU/DI', h('p', { className: K.teks }, dipilih ? `${dipilih.dudi_nama}${dipilih.dudi_alamat ? ` — ${dipilih.dudi_alamat}` : ''}` : '-'), true),
+        __pklField('DU/DI', h('p', { className: K.teks }, asal ? (asal.dudi_nama || '-')
+          : dipilih ? `${dipilih.dudi_nama}${dipilih.dudi_alamat ? ` — ${dipilih.dudi_alamat}` : ''}` : '-'), true),
+        !edit && dudiAcuan && __pklField(asal ? `Salin ke siswa di DU/DI yang sama (${tujuanSalin.length} dipilih)` : `Salin juga ke siswa lain di DU/DI yang sama (opsional, ${tujuanSalin.length} dipilih)`,
+          serumpun.length === 0
+            ? h('p', { className: K.teksKecil }, 'Tidak ada siswa bimbingan lain di DU/DI ini pada tanggal tersebut.')
+            : h('div', { className: K.field },
+              h('div', { className: K.daftarSiswa },
+                serumpun.map((p) => h('label', { key: p.id, className: K.barisSiswa },
+                  h('input', { type: 'checkbox', checked: !!salin[p.id], onChange: (e) => { const v = e.target.checked; setSalin((x) => ({ ...x, [p.id]: v })); } }),
+                  h('span', null, p.siswa_nama),
+                  h('span', { className: K.teksKecil }, p.kelas_nama)))),
+              h('div', { className: K.bar },
+                h('p', { className: K.teksKecil }, 'Isian (termasuk kondisi siswa dan foto) disalin sama untuk tiap siswa. Setelah disimpan, jurnal tiap siswa bisa diubah sendiri-sendiri.'),
+                h('button', { onClick: () => setSalin(semuaDipilih ? {} : Object.fromEntries(serumpun.map((p) => [p.id, true]))), className: K.btnKecil },
+                  semuaDipilih ? 'Batal pilih semua' : 'Pilih semua'))), true),
         __pklField('Jenis kegiatan', h('div', { className: K.toggleWrap },
           [['KUNJUNGAN', 'Kunjungan/Monitoring'], ['DARING', 'Daring'], ['SEKOLAH', 'Di Sekolah']].map(([v, l]) => h('button', {
             key: v, onClick: () => ubah('jenis', v), className: f.jenis === v ? K.toggleOn : K.toggleOff,
@@ -3950,7 +3979,8 @@ Tindakan ini juga akan mencabut akses mereka dan menghapus data penugasan mapel 
           unggah && h('span', { className: K.teksKecil }, 'Mengunggah...')), true)),
       h('div', { className: K.bar },
         h('p', { className: K.teksKecil }, 'Kehadiran harian siswa PKL dicatat oleh tempat PKL, tidak di jurnal ini.'),
-        h('button', { disabled: !ok, onClick: simpan, className: ok ? K.btnHijau : K.btnMati }, proses ? 'Menyimpan...' : 'Simpan Jurnal'))));
+        h('button', { disabled: !ok, onClick: simpan, className: ok ? K.btnHijau : K.btnMati },
+          proses ? 'Menyimpan...' : (!edit && jumlahSimpan > 1 ? `Simpan Jurnal (${jumlahSimpan} siswa)` : 'Simpan Jurnal')))));
 }function __pklTabSiswa({ ktx, onTulis }) {
   const K = __pklK;
   const h = __pklH;
@@ -4051,14 +4081,26 @@ Tindakan ini juga akan mencabut akses mereka dan menghapus data penugasan mapel 
           siswaUnik.map((s) => h('option', { key: s.id, value: s.id }, s.nama)))),
       !form && h('button', { onClick: () => { setForm({}); setPesan(''); }, className: K.btnHijau }, h(es, { size: 14 }), 'Tambah Jurnal')),
     form && h(__pklFormJurnal, {
-      key: form.id || `baru-${form.penempatan_id || ''}`,
+      key: form.id || (form.salinDari ? `salin-${form.salinDari.id}` : `baru-${form.penempatan_id || ''}`),
       awal: form,
       penempatan,
       onSelesai: (msg, tgl) => { setPesan(msg); setForm(null); if (tgl && tgl.slice(0, 7) !== bulan) setBulan(tgl.slice(0, 7)); else muat(); },
       onBatal: () => setForm(null),
     }),
     items === null ? h(__pklMemuat, null)
-      : h(__pklDaftarJurnal, { items, onUbah: (j) => { setForm({ ...j }); setPesan(''); }, onHapus: hapus, kosong: 'Belum ada jurnal bimbingan pada bulan ini.' }));
+      : h(__pklDaftarJurnal, {
+        items,
+        onUbah: (j) => { setForm({ ...j }); setPesan(''); },
+        onSalin: (j) => {
+          setForm({
+            salinDari: j, tanggal: j.tanggal, jam_mulai: j.jam_mulai, jam_selesai: j.jam_selesai, jenis: j.jenis, uraian: j.uraian,
+            kondisi_siswa: j.kondisi_siswa || '', permasalahan: j.permasalahan || '', tindak_lanjut: j.tindak_lanjut || '', foto: j.foto || [],
+          });
+          setPesan('');
+        },
+        onHapus: hapus,
+        kosong: 'Belum ada jurnal bimbingan pada bulan ini.',
+      }));
 }function __pklTabWali({ ktx }) {
   const K = __pklK;
   const h = __pklH;

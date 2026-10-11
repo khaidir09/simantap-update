@@ -1,9 +1,9 @@
 diff --git a/api/bimbingan_pkl.php b/api/bimbingan_pkl.php
 new file mode 100644
-index 0000000..df04169
+index 0000000..8390278
 --- /dev/null
 +++ b/api/bimbingan_pkl.php
-@@ -0,0 +1,1678 @@
+@@ -0,0 +1,1741 @@
 +<?php
 +/**
 + * Jurnal Bimbingan PKL: guru membimbing siswa kelas XII yang sedang Praktik Kerja Lapangan.
@@ -26,6 +26,7 @@ index 0000000..df04169
 +const PKL_JENIS_PENDEK   = ['KUNJUNGAN' => 'Kunjungan', 'DARING' => 'Daring', 'SEKOLAH' => 'Di Sekolah'];
 +const PKL_MAKS_HARI      = 366;
 +const PKL_MAKS_FOTO      = 3;
++const PKL_MAKS_SALIN     = 50;
 +const PKL_MAKS_UNGGAH    = 2 * 1024 * 1024;
 +const PKL_MIME_FOTO      = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp'];
 +const PKL_POLA_FOTO      = '#^uploads/journals/pkl/\d{6}/[a-f0-9]{32}\.(jpg|png|webp)$#';
@@ -456,6 +457,7 @@ index 0000000..df04169
 +    return [
 +        'id'              => $r['id'],
 +        'penempatan_id'   => $r['penempatan_id'],
++        'dudi_id'         => $r['dudi_id'] ?? null,
 +        'guru_id'         => $r['guru_id'],
 +        'guru_nama'       => $r['guru_nama'],
 +        'teacherName'     => $r['guru_nama'],
@@ -1093,8 +1095,49 @@ index 0000000..df04169
 +}
 +
 +/**
++ * Penempatan tujuan "salin jurnal ke siswa lain di DU/DI yang sama" (hanya saat menambah jurnal).
++ * Tiap tujuan: milik guru yang sama, DU/DI sama dengan penempatan utama, tanggal dalam periodenya.
++ */
++function pklTujuanSalin(mysqli $db, array $ctx, array $utama, $salinKe, string $tanggal): array
++{
++    if ($salinKe === null || $salinKe === '' || $salinKe === []) return [];
++    if (!is_array($salinKe)) errorResponse('Daftar siswa salinan tidak valid');
++    $ids = [];
++    foreach ($salinKe as $v) {
++        if (!is_string($v) || trim($v) === '') errorResponse('Daftar siswa salinan tidak valid');
++        $v = trim($v);
++        if ($v !== $utama['id'] && !in_array($v, $ids, true)) $ids[] = $v;
++    }
++    if (count($ids) > PKL_MAKS_SALIN) errorResponse('Maksimal ' . PKL_MAKS_SALIN . ' siswa sekali salin');
++    $hasil = [];
++    foreach ($ids as $pid) {
++        $q = pklAmbilPenempatan($db, $pid);
++        if (!$q) errorResponse('Penempatan siswa salinan tidak ditemukan', 404);
++        if ($q['guru_id'] !== $ctx['uid']) errorResponse('Jurnal hanya dapat disalin ke siswa bimbingan Anda sendiri.', 403);
++        if ($q['dudi_id'] !== $utama['dudi_id']) {
++            errorResponse('Jurnal hanya dapat disalin ke siswa di DU/DI yang sama (' . $q['siswa_nama'] . ' di ' . ($q['dudi_nama'] ?? '-') . ').');
++        }
++        if ($tanggal < $q['tanggal_mulai'] || $tanggal > $q['tanggal_selesai']) {
++            errorResponse('Tanggal jurnal di luar periode penempatan ' . $q['siswa_nama'] . ' (' . pklTglPendek($q['tanggal_mulai']) . ' – ' . pklTglPendek($q['tanggal_selesai']) . ')');
++        }
++        $hasil[] = $q;
++    }
++    return $hasil;
++}
++
++/** 409 bila siswa pada penempatan itu sudah punya jurnal dengan tanggal dan jam mulai yang sama. */
++function pklCekJurnalGanda(mysqli $db, array $p, string $tanggal, string $jamMulai, string $kecualiId = ''): void
++{
++    $ada = pklAmbilSatu($db, "SELECT id FROM pkl_jurnal WHERE penempatan_id = ? AND tanggal = ? AND jam_mulai = ? AND id <> ? LIMIT 1",
++        'ssss', [$p['id'], $tanggal, $jamMulai, $kecualiId]);
++    if ($ada) errorResponse($p['siswa_nama'] . ' sudah punya jurnal bimbingan pada ' . pklTglPendek($tanggal) . ' pukul ' . $jamMulai . '.', 409);
++}
++
++/**
 + * POST ?action=pkl_jurnal_simpan
-+ * body {id?, penempatan_id, tanggal, jam_mulai, jam_selesai, jenis, uraian, kondisi_siswa?, permasalahan?, tindak_lanjut?, foto?[]}
++ * body {id?, penempatan_id, tanggal, jam_mulai, jam_selesai, jenis, uraian, kondisi_siswa?, permasalahan?, tindak_lanjut?, foto?[], salin_ke?[]}
++ * salin_ke (hanya jurnal baru): id penempatan lain milik guru yang sama di DU/DI yang sama. Isian disalin menjadi
++ * jurnal terpisah per siswa (semua tersimpan atau tidak sama sekali); setelahnya tiap jurnal diubah sendiri-sendiri.
 + */
 +function handlePklJurnalSimpan(mysqli $db): void
 +{
@@ -1139,23 +1182,43 @@ index 0000000..df04169
 +    $fotoJson = $foto ? json_encode($foto, JSON_UNESCAPED_SLASHES) : null;
 +    $kini = pklSekarang();
 +
-+    if ($lama === null) {
-+        $id = uniqid('pklj_', true);
-+        $stmt = $db->prepare("INSERT INTO pkl_jurnal (id, penempatan_id, guru_id, guru_nama, siswa_id, tanggal, jam_mulai, jam_selesai, jenis,
-+                                uraian, kondisi_siswa, permasalahan, tindak_lanjut, foto_json, dibuat_pada)
-+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-+        $stmt->bind_param('sssssssssssssss', $id, $penempatanId, $ctx['uid'], $ctx['nama'], $p['siswa_id'], $tanggal, $jamMulai, $jamSelesai,
-+            $jenis, $uraian, $kondisi, $masalah, $tindak, $fotoJson, $kini);
-+    } else {
++    if ($lama !== null) {
++        $salinKe = $body['salin_ke'] ?? [];
++        if (is_array($salinKe) && $salinKe !== []) errorResponse('Salin ke siswa lain hanya tersedia saat menambah jurnal baru.');
++        pklCekJurnalGanda($db, $p, $tanggal, $jamMulai, $id);
 +        $stmt = $db->prepare("UPDATE pkl_jurnal SET tanggal = ?, jam_mulai = ?, jam_selesai = ?, jenis = ?, uraian = ?, kondisi_siswa = ?,
 +                                permasalahan = ?, tindak_lanjut = ?, foto_json = ?, diubah_pada = ? WHERE id = ?");
 +        $stmt->bind_param('sssssssssss', $tanggal, $jamMulai, $jamSelesai, $jenis, $uraian, $kondisi, $masalah, $tindak, $fotoJson, $kini, $id);
++        $stmt->execute();
++        pklHapusFotoYatim($db, array_diff(pklFotoDecode($lama['foto_json']), $foto));
++        $row = pklAmbilSatu($db, PKL_SQL_JURNAL . " WHERE j.id = ?", 's', [$id]);
++        jsonResponse(['success' => true, 'item' => pklBarisJurnal($row, $ctx), 'jumlah' => 1]);
 +    }
-+    $stmt->execute();
-+    if ($lama !== null) pklHapusFotoYatim($db, array_diff(pklFotoDecode($lama['foto_json']), $foto));
 +
-+    $row = pklAmbilSatu($db, PKL_SQL_JURNAL . " WHERE j.id = ?", 's', [$id]);
-+    jsonResponse(['success' => true, 'item' => pklBarisJurnal($row, $ctx)]);
++    $tujuan = array_merge([$p], pklTujuanSalin($db, $ctx, $p, $body['salin_ke'] ?? [], $tanggal));
++    foreach ($tujuan as $q) pklCekJurnalGanda($db, $q, $tanggal, $jamMulai);
++
++    $ids = [];
++    $db->begin_transaction();
++    try {
++        $stmt = $db->prepare("INSERT INTO pkl_jurnal (id, penempatan_id, guru_id, guru_nama, siswa_id, tanggal, jam_mulai, jam_selesai, jenis,
++                                uraian, kondisi_siswa, permasalahan, tindak_lanjut, foto_json, dibuat_pada)
++                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
++        foreach ($tujuan as $q) {
++            $jid = uniqid('pklj_', true);
++            $stmt->bind_param('sssssssssssssss', $jid, $q['id'], $ctx['uid'], $ctx['nama'], $q['siswa_id'], $tanggal, $jamMulai, $jamSelesai,
++                $jenis, $uraian, $kondisi, $masalah, $tindak, $fotoJson, $kini);
++            $stmt->execute();
++            $ids[] = $jid;
++        }
++        $db->commit();
++    } catch (Throwable $e) {
++        $db->rollback();
++        errorResponse('Gagal menyimpan jurnal bimbingan', 500);
++    }
++
++    $row = pklAmbilSatu($db, PKL_SQL_JURNAL . " WHERE j.id = ?", 's', [$ids[0]]);
++    jsonResponse(['success' => true, 'item' => pklBarisJurnal($row, $ctx), 'jumlah' => count($ids), 'ids' => $ids]);
 +}
 +
 +/**

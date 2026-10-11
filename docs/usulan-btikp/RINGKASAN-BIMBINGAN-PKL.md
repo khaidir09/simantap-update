@@ -27,6 +27,8 @@ orang tua. Akibatnya bimbingan PKL dicatat di luar sistem, dan guru kehilangan b
 - **Penempatan** siswa ↔ DU/DI ↔ guru ↔ periode, dengan riwayat (tutup lalu buat baru) dan alih pembimbing oleh Admin.
 - **Jurnal bimbingan** per siswa: Kunjungan/Monitoring, Daring, atau di Sekolah; uraian, kondisi, permasalahan,
   tindak lanjut, foto opsional. Kehadiran harian siswa **tidak** dicatat (ranah tempat PKL).
+- **Salin jurnal** ke siswa lain di DU/DI yang sama: satu kunjungan, satu isian, jurnal terpisah per siswa
+  (semua tersimpan atau tidak sama sekali; jurnal ganda dengan tanggal dan jam mulai yang sama ditolak).
 - **Pantau** untuk Kepala Sekolah/Admin: ringkasan per guru dan daftar siswa XII yang belum punya pembimbing.
   Wali kelas XII melihat siswa kelasnya (hanya baca).
 - **Cetak** A4 ber-kop: rekap bulanan per guru (lampiran e-Kinerja) dan kartu bimbingan per siswa.
@@ -43,5 +45,5 @@ orang tua. Akibatnya bimbingan PKL dicatat di luar sistem, dan guru kehilangan b
 
 ## 4. Pengujian
 
-81 uji API otomatis (`docs/patches/uji-bimbingan-pkl-api.mjs`) lulus, termasuk otorisasi per peran, balapan dua guru,
-validasi tanggal/jam/foto, unggahan berbahaya, dan bukti bahwa presensi/insiden/poin/jurnal mengajar tidak berubah.
+90 uji API otomatis (`docs/patches/uji-bimbingan-pkl-api.mjs`) lulus, termasuk otorisasi per peran, balapan dua guru,
+validasi tanggal/jam/foto, salin jurnal (DU/DI, kepemilikan, periode, jurnal ganda), unggahan berbahaya, dan bukti bahwa presensi/insiden/poin/jurnal mengajar tidak berubah.

@@ -156,6 +156,42 @@ try {
   const sesudah = hitung();
   check('J14 presensi/insiden/poin/panggilan/jurnal mengajar tidak berubah', JSON.stringify(sebelum) === JSON.stringify(sesudah), `${JSON.stringify(sebelum)} vs ${JSON.stringify(sesudah)}`);
 
+  // --- 5b. Salin jurnal ke siswa lain di DU/DI yang sama (semua jurnal uji grup ini dihapus di akhir) ---
+  const jurnalSalin = [];
+  const jurnalDi = async (pid) => (await call('guru_a', 'pkl_jurnal_list', { query: `&penempatan_id=${encodeURIComponent(pid)}` })).json?.items || [];
+  r = await post('guru_a', 'pkl_jurnal_simpan', { ...jurnalBody({ tanggal: hari(-2), jam_mulai: '08:00', jam_selesai: '08:30' }), penempatan_id: P2.id, salin_ke: [P1.id, P2.id, P1.id] });
+  jurnalSalin.push(...(r.json?.ids || []));
+  const diP1 = (await jurnalDi(P1.id)).find((j) => jurnalSalin.includes(j.id));
+  check('S1 salin ke siswa lain di DU/DI sama: 2 jurnal terpisah (duplikat id diabaikan)',
+    r.status === 200 && r.json.jumlah === 2 && r.json.item.penempatan_id === P2.id && diP1?.siswa_id === S(1) && diP1?.tanggal === hari(-2), r.text);
+  r = await post('guru_a', 'pkl_jurnal_simpan', { ...jurnalBody({ tanggal: hari(-2), jam_mulai: '08:00', jam_selesai: '08:30' }), penempatan_id: P2.id });
+  check('S2 jurnal ganda (siswa, tanggal, jam mulai sama) ditolak 409', r.status === 409 && /sudah punya jurnal/.test(r.json?.error || ''), r.text);
+  r = await post('guru_a', 'pkl_jurnal_simpan', { ...jurnalBody({ tanggal: hari(-2), jam_mulai: '15:00', jam_selesai: '16:00' }), penempatan_id: P1.id });
+  jurnalSalin.push(r.json?.item?.id);
+  const nP2 = (await jurnalDi(P2.id)).length;
+  r = await post('guru_a', 'pkl_jurnal_simpan', { ...jurnalBody({ tanggal: hari(-2), jam_mulai: '15:00', jam_selesai: '16:00' }), penempatan_id: P2.id, salin_ke: [P1.id] });
+  check('S3 salah satu tujuan ganda -> 409, tidak ada jurnal tersimpan', r.status === 409 && (await jurnalDi(P2.id)).length === nP2, r.text);
+  const P3B = cariP(await daftarMilik('guru_b'), S(3));
+  r = await post('guru_a', 'pkl_jurnal_simpan', { ...jurnalBody({ tanggal: hari(-2), jam_mulai: '17:00', jam_selesai: '18:00' }), penempatan_id: P2.id, salin_ke: [P3B?.id] });
+  check('S4 salin ke siswa bimbingan guru lain ditolak 403', r.status === 403 && (await jurnalDi(P2.id)).length === nP2, r.text);
+  r = await post('guru_a', 'pkl_dudi_simpan', { nama: 'CV Lain Salin Uji PKL' });
+  const DUDI_C = r.json?.item?.id;
+  for (const [id, dudi, pola] of [['S5 DU/DI berbeda', DUDI_C, /DU\/DI yang sama/], ['S6 tanggal di luar periode tujuan', DUDI, /di luar periode/]]) {
+    r = await post('guru_a', 'pkl_penempatan_simpan', { siswa_ids: [S(1)], dudi_id: dudi, tanggal_mulai: hari(31), tanggal_selesai: hari(40) });
+    const PX = r.json?.tersimpan?.[0];
+    r = await post('guru_a', 'pkl_jurnal_simpan', { ...jurnalBody({ tanggal: hari(-2), jam_mulai: '17:00', jam_selesai: '18:00' }), penempatan_id: P2.id, salin_ke: [PX?.id] });
+    check(`${id} ditolak 400`, r.status === 400 && pola.test(r.json?.error || ''), r.text);
+    await post('guru_a', 'pkl_penempatan_hapus', { id: PX?.id });
+  }
+  await post('admin', 'pkl_dudi_hapus', { id: DUDI_C });
+  r = await post('guru_a', 'pkl_jurnal_simpan', { ...jurnalBody({ tanggal: hari(-2), jam_mulai: '08:00', jam_selesai: '08:30' }), id: jurnalSalin[0], salin_ke: [P1.id] });
+  check('S7 salin saat mengubah jurnal ditolak 400', r.status === 400, r.text);
+  r = await post('guru_a', 'pkl_jurnal_simpan', { ...jurnalBody({ tanggal: hari(-2), jam_mulai: '08:00', jam_selesai: '09:00' }), id: jurnalSalin[0] });
+  const salinanP1 = (await jurnalDi(P1.id)).find((j) => j.id === jurnalSalin[1]);
+  check('S8 jurnal hasil salin diubah sendiri-sendiri', r.status === 200 && r.json.item.jam_selesai === '09:00' && salinanP1?.jam_selesai === '08:30', r.text);
+  for (const id of jurnalSalin.filter(Boolean)) await post('guru_a', 'pkl_jurnal_hapus', { id });
+  check('S9 jurnal uji salin dibersihkan', (await jurnalDi(P1.id)).length === 3, '');
+
   // --- 6. Unggahan berbahaya ---
   r = await unggah('guru_a', Buffer.from('<?php echo 1; ?>'), 'shell.jpg');
   check('F2 file PHP berganti nama .jpg ditolak', r.status === 400, r.text);

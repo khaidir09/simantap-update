@@ -1,0 +1,365 @@
+diff --git a/api/endpoints_tu.php b/api/endpoints_tu.php
+index 0437e19..66c7345 100644
+--- a/api/endpoints_tu.php
++++ b/api/endpoints_tu.php
+@@ -333,7 +333,7 @@ switch ($action) {
+                 // Derive class_level from first kelas (e.g. "X 1, X 2, XI 1" -> "X")
+                 $kelasList = array_filter(array_map('trim', explode(',', $syncKelas)));
+                 $firstKelas = $kelasList[0] ?? '';
+-                $classLevel = preg_match('/^(X{1,3}|XI{0,2}|IX|VIII|VII|XII|XI|X)\b/i', $firstKelas, $m) ? strtoupper($m[1]) : '';
++                $classLevel = jenjangParseLevel($firstKelas, jenjangAktif($db)['levels']);
+ 
+                 // class_ids array from kelas list
+                 $classIdsJson = json_encode(array_values(array_unique($kelasList)));
+diff --git a/api/endpoints_v2.php b/api/endpoints_v2.php
+index 28427b4..9e86347 100644
+--- a/api/endpoints_v2.php
++++ b/api/endpoints_v2.php
+@@ -183,6 +183,10 @@ switch ($action) {
+         while ($row = $res->fetch_assoc()) {
+             $config[$row['config_key']] = $row['config_value'];
+         }
++        // Jenjang efektif (pengaturan atau deteksi dari nama sekolah) — lihat jenjang_sekolah.php
++        $jenjang = jenjangAktif($db);
++        $config['school_level'] = $jenjang['jenjang'];
++        $config['school_level_sumber'] = $jenjang['sumber'];
+         jsonResponse($config);
+         break;
+ 
+diff --git a/api/endpoints_v3.php b/api/endpoints_v3.php
+index 2c89107..b269477 100644
+--- a/api/endpoints_v3.php
++++ b/api/endpoints_v3.php
+@@ -570,9 +570,16 @@ switch ($action) {
+         // Coba insert data awal dari students jika classes kosong
+         $res = $db->query("SELECT COUNT(*) as c FROM classes");
+         if ($res && $res->fetch_assoc()['c'] == 0) {
+-            $db->query("INSERT IGNORE INTO classes (id, name, level) 
+-                        SELECT DISTINCT class_id, class_name, SUBSTRING_INDEX(class_id, ' ', 1) 
+-                        FROM students WHERE class_id IS NOT NULL AND class_id != ''");
++            // Level diturunkan dengan parser jenjang (mengenali I–XII dan angka 1–12), bukan token pertama
++            $levelsJenjang = jenjangAktif($db)['levels'];
++            $resSiswa = $db->query("SELECT DISTINCT class_id, class_name FROM students WHERE class_id IS NOT NULL AND class_id != ''");
++            $insKelas = $db->prepare("INSERT IGNORE INTO classes (id, name, level) VALUES (?, ?, ?)");
++            while ($resSiswa && ($k = $resSiswa->fetch_assoc())) {
++                $namaKelas = (string)($k['class_name'] ?? '') !== '' ? (string)$k['class_name'] : (string)$k['class_id'];
++                $levelKelas = jenjangParseLevel($k['class_id'], $levelsJenjang) ?: jenjangParseLevel($namaKelas, $levelsJenjang);
++                $insKelas->bind_param("sss", $k['class_id'], $namaKelas, $levelKelas);
++                $insKelas->execute();
++            }
+         }
+         
+         $sql = "SELECT c.*, 
+diff --git a/api/index.php b/api/index.php
+index d119c06..20dd777 100644
+--- a/api/index.php
++++ b/api/index.php
+@@ -34,6 +34,7 @@ simantapLicenseGuard();
+ define('SIMANTAP_API', true);
+ 
+ require_once __DIR__ . '/db.php';
++require_once __DIR__ . '/jenjang_sekolah.php';
+ require_once __DIR__ . '/kesiswaan_access.php';
+ require_once __DIR__ . '/ekskul_access.php';
+ require_once __DIR__ . '/lesson_access.php';
+@@ -1619,6 +1620,11 @@ switch ($action) {
+                 'description' => $row['description']
+             ];
+         }
++        // Jenjang belum diatur/tidak valid: kirim hasil deteksi (tidak disimpan). Lihat jenjang_sekolah.php
++        $jenjang = jenjangAktif($db);
++        if ($jenjang['sumber'] === 'deteksi') {
++            $config['school_level'] = ['value' => $jenjang['jenjang'], 'description' => 'Terdeteksi otomatis dari nama sekolah'];
++        }
+         jsonResponse($config);
+         break;
+ 
+@@ -1630,6 +1636,25 @@ switch ($action) {
+ 
+         if (!is_array($updates)) errorResponse('Format data tidak valid');
+ 
++        // Jenjang sekolah: validasi nilai + peringatan bila ada data di luar jenjang baru (409 sampai dikonfirmasi)
++        $konfirmasiJenjang = ($body['konfirmasi_jenjang'] ?? $updates['konfirmasi_jenjang'] ?? false) === true;
++        unset($updates['konfirmasi_jenjang'], $updates['school_level_sumber']);
++        if (array_key_exists('school_level', $updates)) {
++            $jenjangBaru = is_scalar($updates['school_level']) ? strtoupper(trim((string)$updates['school_level'])) : '';
++            if (!isset(jenjangDaftar()[$jenjangBaru])) errorResponse('Jenjang sekolah tidak valid.');
++            $updates['school_level'] = $jenjangBaru;
++            $jenjangLama = jenjangAktif($db)['jenjang'];
++            if ($jenjangBaru !== $jenjangLama && !$konfirmasiJenjang) {
++                $tidakCocok = jenjangHitungTidakCocok($db, $jenjangBaru);
++                if (array_sum($tidakCocok) > 0) {
++                    jsonResponse([
++                        'error' => "Ada data dengan level kelas di luar jenjang $jenjangBaru. Konfirmasi untuk tetap mengubah jenjang.",
++                        'peringatan_jenjang' => $tidakCocok + ['dari' => $jenjangLama, 'ke' => $jenjangBaru],
++                    ], 409);
++                }
++            }
++        }
++
+         $db->begin_transaction();
+         try {
+             foreach ($updates as $key => $value) {
+@@ -1639,6 +1664,9 @@ switch ($action) {
+                 $stmt->bind_param("ss", $key, $valStr);
+                 $stmt->execute();
+             }
++            if (isset($updates['school_level'])) {
++                $db->query("UPDATE system_config SET description = 'Jenjang sekolah (SD/SMP/SMA/SMK)' WHERE config_key = 'school_level' AND (description IS NULL OR description = '')");
++            }
+             $db->commit();
+             jsonResponse(['success' => true]);
+         } catch (Exception $e) {
+@@ -2386,66 +2414,82 @@ switch ($action) {
+ 
+     // --- JURNAL BIMBINGAN PKL (docs/specs/jurnal-bimbingan-pkl.md) ---
+     case 'pkl_konteks':
++        jenjangWajibPkl($db);
+         handlePklKonteks($db);
+         break;
+ 
+     case 'pkl_dudi_list':
++        jenjangWajibPkl($db);
+         handlePklDudiList($db);
+         break;
+ 
+     case 'pkl_dudi_simpan':
++        jenjangWajibPkl($db);
+         handlePklDudiSimpan($db);
+         break;
+ 
+     case 'pkl_dudi_hapus':
++        jenjangWajibPkl($db);
+         handlePklDudiHapus($db);
+         break;
+ 
+     case 'pkl_kandidat_siswa':
++        jenjangWajibPkl($db);
+         handlePklKandidatSiswa($db);
+         break;
+ 
+     case 'pkl_penempatan_list':
++        jenjangWajibPkl($db);
+         handlePklPenempatanList($db);
+         break;
+ 
+     case 'pkl_penempatan_simpan':
++        jenjangWajibPkl($db);
+         handlePklPenempatanSimpan($db);
+         break;
+ 
+     case 'pkl_penempatan_tutup':
++        jenjangWajibPkl($db);
+         handlePklPenempatanTutup($db);
+         break;
+ 
+     case 'pkl_penempatan_alih':
++        jenjangWajibPkl($db);
+         handlePklPenempatanAlih($db);
+         break;
+ 
+     case 'pkl_penempatan_hapus':
++        jenjangWajibPkl($db);
+         handlePklPenempatanHapus($db);
+         break;
+ 
+     case 'pkl_jurnal_list':
++        jenjangWajibPkl($db);
+         handlePklJurnalList($db);
+         break;
+ 
+     case 'pkl_jurnal_simpan':
++        jenjangWajibPkl($db);
+         handlePklJurnalSimpan($db);
+         break;
+ 
+     case 'pkl_jurnal_hapus':
++        jenjangWajibPkl($db);
+         handlePklJurnalHapus($db);
+         break;
+ 
+     case 'pkl_unggah_foto':
++        jenjangWajibPkl($db);
+         handlePklUnggahFoto($db);
+         break;
+ 
+     case 'pkl_cetak_rekap':
++        jenjangWajibPkl($db, true);
+         handlePklCetakRekap($db);
+         break;
+ 
+     case 'pkl_cetak_kartu':
++        jenjangWajibPkl($db, true);
+         handlePklCetakKartu($db);
+         break;
+ 
+diff --git a/api/jenjang_sekolah.php b/api/jenjang_sekolah.php
+new file mode 100644
+index 0000000..36e9a9c
+--- /dev/null
++++ b/api/jenjang_sekolah.php
+@@ -0,0 +1,164 @@
++<?php
++// jenjang_sekolah.php - Helper jenjang sekolah (SD/SMP/SMA/SMK): daftar level kelas per jenjang,
++// deteksi jenjang dari nama sekolah, parser level kelas, hitungan data di luar jenjang,
++// dan guard fitur PKL (khusus SMK). Tidak punya action sendiri.
++// Lihat docs/specs/jenjang-sekolah-dinamis.md
++if (!defined('SIMANTAP_API')) exit;
++
++const JENJANG_MSG_PKL = 'Fitur Bimbingan PKL hanya tersedia untuk jenjang SMK.';
++
++/** Level kelas (Romawi, urut) per jenjang. */
++function jenjangDaftar(): array
++{
++    return [
++        'SD'  => ['I', 'II', 'III', 'IV', 'V', 'VI'],
++        'SMP' => ['VII', 'VIII', 'IX'],
++        'SMA' => ['X', 'XI', 'XII'],
++        'SMK' => ['X', 'XI', 'XII'],
++    ];
++}
++
++/**
++ * Tebak jenjang dari nama sekolah (dipakai hanya bila system_config.school_level belum ada/tidak valid).
++ * Urutan: SMK → SMP → SD → selain itu SMA (termasuk MA/MAN dan teks kosong).
++ */
++function jenjangDeteksi(string $namaSekolah): string
++{
++    $t = mb_strtoupper($namaSekolah);
++    if (preg_match('/\b(SMK|STM|SMEA)|\bMAK\b/u', $t)) return 'SMK';
++    if (preg_match('/\b(SMP|SLTP|MTS)/u', $t)) return 'SMP';
++    if (preg_match('/\b(SD|SDN|SDS|SDIT|MI|MIN|MIS)\b/u', $t)) return 'SD';
++    return 'SMA';
++}
++
++/**
++ * Jenjang efektif: nilai pengaturan bila valid, selain itu hasil deteksi. Di-cache per request.
++ * @return array{jenjang:string, sumber:string, levels:string[], pkl_aktif:bool}
++ */
++function jenjangAktif(mysqli $db, bool $segarkan = false): array
++{
++    static $cache = null;
++    if ($cache !== null && !$segarkan) return $cache;
++
++    $nilai = [];
++    try {
++        $res = $db->query("SELECT config_key, config_value FROM system_config WHERE config_key IN ('school_level','kop_sekolah','kop_instansi')");
++        while ($res && ($row = $res->fetch_assoc())) $nilai[$row['config_key']] = (string)$row['config_value'];
++    } catch (Throwable $e) {
++        error_log('[SIMANTAP] baca jenjang sekolah: ' . $e->getMessage());
++    }
++
++    $daftar = jenjangDaftar();
++    $jenjang = strtoupper(trim($nilai['school_level'] ?? ''));
++    $sumber = 'pengaturan';
++    if (!isset($daftar[$jenjang])) {
++        $nama = trim($nilai['kop_sekolah'] ?? '');
++        if ($nama === '') $nama = trim($nilai['kop_instansi'] ?? '');
++        $jenjang = jenjangDeteksi($nama);
++        $sumber = 'deteksi';
++    }
++    return $cache = [
++        'jenjang'   => $jenjang,
++        'sumber'    => $sumber,
++        'levels'    => $daftar[$jenjang],
++        'pkl_aktif' => $jenjang === 'SMK',
++    ];
++}
++
++/**
++ * Level kelas (Romawi) dari teks ID/nama kelas, '' bila tidak dikenali.
++ * Aturan harus identik dengan __jjParseLevel di docs/patches/apply-jenjang-sekolah-bundle.js.
++ *  1. buang prefiks "KELAS "; 2. angka 1–12 di depan → Romawi ("7A" → VII);
++ *  3. Romawi diikuti pemisah (spasi _ - . /) atau akhir teks;
++ *  4. Romawi menempel huruf ("XIIA") hanya bila level itu termasuk $levels (agar "IPA 1" ≠ I).
++ */
++function jenjangParseLevel(?string $teks, array $levels): string
++{
++    static $romawi = ['XII', 'VIII', 'XI', 'VII', 'III', 'IX', 'IV', 'VI', 'II', 'X', 'V', 'I'];
++    static $angka = ['', 'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII'];
++
++    $t = strtoupper(trim((string)$teks));
++    $t = preg_replace('/^KELAS\s+/', '', $t);
++    if ($t === '') return '';
++
++    if (preg_match('/^(1[0-2]|[1-9])(?![0-9])/', $t, $m)) return $angka[(int)$m[1]];
++
++    foreach ($romawi as $r) {
++        if (!str_starts_with($t, $r)) continue;
++        $s = substr($t, strlen($r), 1);
++        if ($s === '' || preg_match('/[\s_\-.\/]/', $s)) return $r;
++    }
++    foreach ($romawi as $r) {
++        if (!str_starts_with($t, $r)) continue;
++        $s = substr($t, strlen($r), 1);
++        if (preg_match('/[A-Z]/', $s) && !preg_match('/[IVX]/', $s) && in_array($r, $levels, true)) return $r;
++    }
++    return '';
++}
++
++/** Apakah $level (sudah diparse) di luar daftar $levels. Level kosong tidak dihitung. */
++function jenjangDiLuar(string $level, array $levels): bool
++{
++    return $level !== '' && !in_array($level, $levels, true);
++}
++
++/**
++ * Jumlah data yang levelnya di luar jenjang $jenjangBaru (untuk peringatan saat ganti jenjang).
++ * @return array{kelas:int, penugasan:int, siswa:int}
++ */
++function jenjangHitungTidakCocok(mysqli $db, string $jenjangBaru): array
++{
++    $levels = jenjangDaftar()[$jenjangBaru] ?? [];
++    $hasil = ['kelas' => 0, 'penugasan' => 0, 'siswa' => 0];
++
++    try {
++        $res = $db->query("SELECT id, name, level FROM classes");
++        while ($res && ($r = $res->fetch_assoc())) {
++            $lv = jenjangParseLevel($r['level'], $levels)
++                ?: jenjangParseLevel($r['id'], $levels)
++                ?: jenjangParseLevel($r['name'], $levels);
++            if (jenjangDiLuar($lv, $levels)) $hasil['kelas']++;
++        }
++    } catch (Throwable $e) {
++        // Tabel classes dibuat saat get_classes pertama; belum ada berarti tidak ada kelas.
++    }
++
++    try {
++        $res = $db->query("SELECT class_level FROM teacher_subjects WHERE class_level IS NOT NULL AND TRIM(class_level) <> ''");
++        while ($res && ($r = $res->fetch_assoc())) {
++            $mentah = strtoupper(trim((string)$r['class_level']));
++            $lv = jenjangParseLevel($mentah, $levels) ?: $mentah;
++            if (jenjangDiLuar($lv, $levels)) $hasil['penugasan']++;
++        }
++    } catch (Throwable $e) {
++        error_log('[SIMANTAP] hitung penugasan di luar jenjang: ' . $e->getMessage());
++    }
++
++    try {
++        $res = $db->query("SELECT class_id, class_name FROM students WHERE LOWER(status) = 'aktif'");
++        while ($res && ($r = $res->fetch_assoc())) {
++            $lv = jenjangParseLevel($r['class_id'], $levels) ?: jenjangParseLevel($r['class_name'], $levels);
++            if (jenjangDiLuar($lv, $levels)) $hasil['siswa']++;
++        }
++    } catch (Throwable $e) {
++        error_log('[SIMANTAP] hitung siswa di luar jenjang: ' . $e->getMessage());
++    }
++
++    return $hasil;
++}
++
++/**
++ * Guard aksi pkl_*: tolak bila jenjang bukan SMK. Halaman cetak ($html) menjawab dengan HTML.
++ * Login tetap dicek lebih dulu agar sesi habis menghasilkan 401, bukan pesan PKL.
++ */
++function jenjangWajibPkl(mysqli $db, bool $html = false): void
++{
++    if ($html) {
++        $sesi = getCurrentUser();
++        if (!$sesi || empty($sesi['uid'])) pklHtmlError(401, 'Sesi Anda telah berakhir. Silakan login ulang.');
++        if (!jenjangAktif($db)['pkl_aktif']) pklHtmlError(403, JENJANG_MSG_PKL);
++        return;
++    }
++    requireAuth();
++    if (!jenjangAktif($db)['pkl_aktif']) errorResponse(JENJANG_MSG_PKL, 403);
++}

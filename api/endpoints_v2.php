@@ -183,6 +183,10 @@ switch ($action) {
         while ($row = $res->fetch_assoc()) {
             $config[$row['config_key']] = $row['config_value'];
         }
+        // Jenjang efektif (pengaturan atau deteksi dari nama sekolah) — lihat jenjang_sekolah.php
+        $jenjang = jenjangAktif($db);
+        $config['school_level'] = $jenjang['jenjang'];
+        $config['school_level_sumber'] = $jenjang['sumber'];
         jsonResponse($config);
         break;
 

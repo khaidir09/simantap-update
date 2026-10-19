@@ -570,9 +570,16 @@ switch ($action) {
         // Coba insert data awal dari students jika classes kosong
         $res = $db->query("SELECT COUNT(*) as c FROM classes");
         if ($res && $res->fetch_assoc()['c'] == 0) {
-            $db->query("INSERT IGNORE INTO classes (id, name, level) 
-                        SELECT DISTINCT class_id, class_name, SUBSTRING_INDEX(class_id, ' ', 1) 
-                        FROM students WHERE class_id IS NOT NULL AND class_id != ''");
+            // Level diturunkan dengan parser jenjang (mengenali I–XII dan angka 1–12), bukan token pertama
+            $levelsJenjang = jenjangAktif($db)['levels'];
+            $resSiswa = $db->query("SELECT DISTINCT class_id, class_name FROM students WHERE class_id IS NOT NULL AND class_id != ''");
+            $insKelas = $db->prepare("INSERT IGNORE INTO classes (id, name, level) VALUES (?, ?, ?)");
+            while ($resSiswa && ($k = $resSiswa->fetch_assoc())) {
+                $namaKelas = (string)($k['class_name'] ?? '') !== '' ? (string)$k['class_name'] : (string)$k['class_id'];
+                $levelKelas = jenjangParseLevel($k['class_id'], $levelsJenjang) ?: jenjangParseLevel($namaKelas, $levelsJenjang);
+                $insKelas->bind_param("sss", $k['class_id'], $namaKelas, $levelKelas);
+                $insKelas->execute();
+            }
         }
         
         $sql = "SELECT c.*, 

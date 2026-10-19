@@ -333,7 +333,7 @@ switch ($action) {
                 // Derive class_level from first kelas (e.g. "X 1, X 2, XI 1" -> "X")
                 $kelasList = array_filter(array_map('trim', explode(',', $syncKelas)));
                 $firstKelas = $kelasList[0] ?? '';
-                $classLevel = preg_match('/^(X{1,3}|XI{0,2}|IX|VIII|VII|XII|XI|X)\b/i', $firstKelas, $m) ? strtoupper($m[1]) : '';
+                $classLevel = jenjangParseLevel($firstKelas, jenjangAktif($db)['levels']);
 
                 // class_ids array from kelas list
                 $classIdsJson = json_encode(array_values(array_unique($kelasList)));

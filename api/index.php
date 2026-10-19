@@ -34,6 +34,7 @@ simantapLicenseGuard();
 define('SIMANTAP_API', true);
 
 require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/jenjang_sekolah.php';
 require_once __DIR__ . '/kesiswaan_access.php';
 require_once __DIR__ . '/ekskul_access.php';
 require_once __DIR__ . '/lesson_access.php';
@@ -1619,6 +1620,11 @@ switch ($action) {
                 'description' => $row['description']
             ];
         }
+        // Jenjang belum diatur/tidak valid: kirim hasil deteksi (tidak disimpan). Lihat jenjang_sekolah.php
+        $jenjang = jenjangAktif($db);
+        if ($jenjang['sumber'] === 'deteksi') {
+            $config['school_level'] = ['value' => $jenjang['jenjang'], 'description' => 'Terdeteksi otomatis dari nama sekolah'];
+        }
         jsonResponse($config);
         break;
 
@@ -1630,6 +1636,25 @@ switch ($action) {
 
         if (!is_array($updates)) errorResponse('Format data tidak valid');
 
+        // Jenjang sekolah: validasi nilai + peringatan bila ada data di luar jenjang baru (409 sampai dikonfirmasi)
+        $konfirmasiJenjang = ($body['konfirmasi_jenjang'] ?? $updates['konfirmasi_jenjang'] ?? false) === true;
+        unset($updates['konfirmasi_jenjang'], $updates['school_level_sumber']);
+        if (array_key_exists('school_level', $updates)) {
+            $jenjangBaru = is_scalar($updates['school_level']) ? strtoupper(trim((string)$updates['school_level'])) : '';
+            if (!isset(jenjangDaftar()[$jenjangBaru])) errorResponse('Jenjang sekolah tidak valid.');
+            $updates['school_level'] = $jenjangBaru;
+            $jenjangLama = jenjangAktif($db)['jenjang'];
+            if ($jenjangBaru !== $jenjangLama && !$konfirmasiJenjang) {
+                $tidakCocok = jenjangHitungTidakCocok($db, $jenjangBaru);
+                if (array_sum($tidakCocok) > 0) {
+                    jsonResponse([
+                        'error' => "Ada data dengan level kelas di luar jenjang $jenjangBaru. Konfirmasi untuk tetap mengubah jenjang.",
+                        'peringatan_jenjang' => $tidakCocok + ['dari' => $jenjangLama, 'ke' => $jenjangBaru],
+                    ], 409);
+                }
+            }
+        }
+
         $db->begin_transaction();
         try {
             foreach ($updates as $key => $value) {
@@ -1638,6 +1663,9 @@ switch ($action) {
                 $stmt = $db->prepare("INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)");
                 $stmt->bind_param("ss", $key, $valStr);
                 $stmt->execute();
+            }
+            if (isset($updates['school_level'])) {
+                $db->query("UPDATE system_config SET description = 'Jenjang sekolah (SD/SMP/SMA/SMK)' WHERE config_key = 'school_level' AND (description IS NULL OR description = '')");
             }
             $db->commit();
             jsonResponse(['success' => true]);
@@ -2386,66 +2414,82 @@ switch ($action) {
 
     // --- JURNAL BIMBINGAN PKL (docs/specs/jurnal-bimbingan-pkl.md) ---
     case 'pkl_konteks':
+        jenjangWajibPkl($db);
         handlePklKonteks($db);
         break;
 
     case 'pkl_dudi_list':
+        jenjangWajibPkl($db);
         handlePklDudiList($db);
         break;
 
     case 'pkl_dudi_simpan':
+        jenjangWajibPkl($db);
         handlePklDudiSimpan($db);
         break;
 
     case 'pkl_dudi_hapus':
+        jenjangWajibPkl($db);
         handlePklDudiHapus($db);
         break;
 
     case 'pkl_kandidat_siswa':
+        jenjangWajibPkl($db);
         handlePklKandidatSiswa($db);
         break;
 
     case 'pkl_penempatan_list':
+        jenjangWajibPkl($db);
         handlePklPenempatanList($db);
         break;
 
     case 'pkl_penempatan_simpan':
+        jenjangWajibPkl($db);
         handlePklPenempatanSimpan($db);
         break;
 
     case 'pkl_penempatan_tutup':
+        jenjangWajibPkl($db);
         handlePklPenempatanTutup($db);
         break;
 
     case 'pkl_penempatan_alih':
+        jenjangWajibPkl($db);
         handlePklPenempatanAlih($db);
         break;
 
     case 'pkl_penempatan_hapus':
+        jenjangWajibPkl($db);
         handlePklPenempatanHapus($db);
         break;
 
     case 'pkl_jurnal_list':
+        jenjangWajibPkl($db);
         handlePklJurnalList($db);
         break;
 
     case 'pkl_jurnal_simpan':
+        jenjangWajibPkl($db);
         handlePklJurnalSimpan($db);
         break;
 
     case 'pkl_jurnal_hapus':
+        jenjangWajibPkl($db);
         handlePklJurnalHapus($db);
         break;
 
     case 'pkl_unggah_foto':
+        jenjangWajibPkl($db);
         handlePklUnggahFoto($db);
         break;
 
     case 'pkl_cetak_rekap':
+        jenjangWajibPkl($db, true);
         handlePklCetakRekap($db);
         break;
 
     case 'pkl_cetak_kartu':
+        jenjangWajibPkl($db, true);
         handlePklCetakKartu($db);
         break;
 

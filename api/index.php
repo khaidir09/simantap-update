@@ -48,6 +48,7 @@ require_once __DIR__ . '/presensi_jam_sebelumnya.php';
 require_once __DIR__ . '/label_media.php';
 require_once __DIR__ . '/portal_nilai.php';
 require_once __DIR__ . '/persetujuan_jurnal.php';
+require_once __DIR__ . '/verifikasi_jurnal.php';
 require_once __DIR__ . '/kelola_guru.php';
 require_once __DIR__ . '/bimbingan_pkl.php';
 
@@ -419,12 +420,17 @@ switch ($action) {
     // --- JOURNALS ---
     case 'get_journals':
         $user = requireAuth();
+        vjPastikanMigrasi($db);
+        $namaKepsek = vjNamaKepsek($db);
         // GURU can only see their own journals; ADMIN/KEPALA_SEKOLAH see all
         // NIP guru diambil dari users, cadangan dari gtk_pegawai (gtk_pegawai.id = users.uid)
-        $selJournal = "SELECT j.*, COALESCE(NULLIF(u.nip, ''), NULLIF(g.nip, ''), '') AS teacherNip"
+        // Nama pengesah: user verifikator (v); jurnal SAH otomatis (SISTEM) memakai nama kepala sekolah
+        $selJournal = "SELECT j.*, COALESCE(NULLIF(u.nip, ''), NULLIF(g.nip, ''), '') AS teacherNip,"
+            . " v.displayName AS verifierName"
             . " FROM journal_entries j"
             . " LEFT JOIN users u ON u.uid = j.teacherId"
-            . " LEFT JOIN gtk_pegawai g ON g.id = j.teacherId";
+            . " LEFT JOIN gtk_pegawai g ON g.id = j.teacherId"
+            . " LEFT JOIN users v ON v.uid = j.verifiedBy";
         if ($user['role'] === 'GURU') {
             $stmt = $db->prepare($selJournal . " WHERE j.teacherId = ? ORDER BY j.date DESC, j.createdAt DESC");
             $stmt->bind_param("s", $user['uid']);
@@ -459,6 +465,16 @@ switch ($action) {
             $row['jamSelesai']         = $row['jam_selesai']?? '';
             $row['time']               = $row['period']     ?? '';
             $row['teacherNip']         = $row['teacherNip'] ?? '';
+            // verifiedBy 'SISTEM' hanya tercatat di database; tampilannya atas nama kepala sekolah
+            $verifiedByRaw = (string)($row['verifiedBy'] ?? '');
+            if ($verifiedByRaw === '') {
+                $row['verifiedByName'] = '';
+            } elseif ($verifiedByRaw !== VJ_SISTEM && !empty($row['verifierName'])) {
+                $row['verifiedByName'] = $row['verifierName'];
+            } else {
+                $row['verifiedByName'] = $namaKepsek;
+            }
+            unset($row['verifierName']);
             // Compute attendanceRate from stored value or recalculate from attendance data
             $storedRate = isset($row['attendanceRate']) ? (int)$row['attendanceRate'] : 0;
             if ($storedRate > 0) {
@@ -482,7 +498,10 @@ switch ($action) {
 
         // Cek kepemilikan dan kunci verifikasi sebelum transaksi, agar presensi/insiden
         // tidak ikut tertulis saat ditolak. Selain ADMIN/KEPALA_SEKOLAH hanya boleh mengubah
-        // jurnal miliknya sendiri yang belum diverifikasi.
+        // jurnal miliknya sendiri; dalam mode MANUAL juga hanya yang belum diverifikasi
+        // (lihat verifikasi_jurnal.php).
+        vjPastikanMigrasi($db);
+        $verifOtomatis = vjOtomatis($db);
         $stmtOld = $db->prepare("SELECT teacherId, isVerified, verifiedBy, verifiedAt, date, studentAttendance, isDraft FROM journal_entries WHERE id = ?");
         $stmtOld->bind_param("s", $id);
         $stmtOld->execute();
@@ -492,7 +511,7 @@ switch ($action) {
             if ($existing['teacherId'] !== $user['uid']) {
                 errorResponse('Anda tidak berhak mengubah jurnal guru lain', 403);
             }
-            if ((int)$existing['isVerified'] === 1) {
+            if (!$verifOtomatis && (int)$existing['isVerified'] === 1) {
                 errorResponse('Jurnal sudah diverifikasi dan tidak dapat diubah', 403);
             }
         }
@@ -522,11 +541,17 @@ switch ($action) {
         $obstacles   = $body['kendala'] ?? $body['obstacles'] ?? null;
         $followUp    = $body['tindakLanjut'] ?? $body['followUp'] ?? null;
         $isDraft     = isset($body['isDraft']) ? (int)(bool)$body['isDraft'] : 1;
-        // Status verifikasi tidak pernah diambil dari body: jurnal baru selalu belum
-        // terverifikasi, edit mempertahankan status lama.
+        // Status verifikasi tidak pernah diambil dari body: edit mempertahankan status lama.
+        // Jurnal yang belum SAH: mode OTOMATIS → SAH oleh SISTEM saat dikirim (non-draf);
+        // mode MANUAL → tetap belum terverifikasi sampai disetujui Kepala Sekolah.
         $isVerified  = $existing ? (int)$existing['isVerified'] : 0;
         $verifiedBy  = $existing ? $existing['verifiedBy'] : null;
         $verifiedAt  = $existing ? $existing['verifiedAt'] : null;
+        if (!$isVerified && $verifOtomatis && !$isDraft) {
+            $isVerified = 1;
+            $verifiedBy = VJ_SISTEM;
+            $verifiedAt = date('Y-m-d H:i:s');
+        }
         if ($isVerified) $isDraft = 0;
         $assessment_data = $body['assessment_data'] ?? null;
         $has_assessment  = isset($body['has_assessment']) ? (int)$body['has_assessment'] : 0;
@@ -611,8 +636,10 @@ switch ($action) {
         $id = $_GET['id'] ?? '';
         if (empty($id)) errorResponse('ID Jurnal wajib diisi');
 
-        // Selain ADMIN/KEPALA_SEKOLAH hanya boleh menghapus jurnal miliknya sendiri
-        // yang belum diverifikasi.
+        // Selain ADMIN/KEPALA_SEKOLAH hanya boleh menghapus jurnal miliknya sendiri;
+        // dalam mode MANUAL juga hanya yang belum diverifikasi.
+        vjPastikanMigrasi($db);
+        $verifOtomatis = vjOtomatis($db);
         if (!in_array($user['role'], ['ADMIN', 'KEPALA_SEKOLAH'])) {
             $stmtOwner = $db->prepare("SELECT teacherId, isVerified FROM journal_entries WHERE id = ?");
             $stmtOwner->bind_param("s", $id);
@@ -621,7 +648,7 @@ switch ($action) {
             if ($existing && $existing['teacherId'] !== $user['uid']) {
                 errorResponse('Anda tidak berhak menghapus jurnal guru lain', 403);
             }
-            if ($existing && (int)$existing['isVerified'] === 1) {
+            if (!$verifOtomatis && $existing && (int)$existing['isVerified'] === 1) {
                 errorResponse('Jurnal sudah diverifikasi dan tidak dapat dihapus', 403);
             }
         }
@@ -1612,6 +1639,7 @@ switch ($action) {
 
     // --- SYSTEM CONFIG (Kop Surat & pengaturan lain) ---
     case 'get_system_config':
+        vjPastikanMigrasi($db);
         $res = $db->query("SELECT config_key, config_value, description FROM system_config");
         $config = [];
         while ($row = $res->fetch_assoc()) {
@@ -1624,6 +1652,12 @@ switch ($action) {
         $jenjang = jenjangAktif($db);
         if ($jenjang['sumber'] === 'deteksi') {
             $config['school_level'] = ['value' => $jenjang['jenjang'], 'description' => 'Terdeteksi otomatis dari nama sekolah'];
+        }
+        // Mode verifikasi jurnal: selalu kirim mode efektif (key belum ada/tidak valid → OTOMATIS)
+        if (vjNormalisasi($config[VJ_KEY_MODE]['value'] ?? '') === '') {
+            $config[VJ_KEY_MODE] = ['value' => VJ_MODE_DEFAULT, 'description' => 'Bawaan'];
+        } else {
+            $config[VJ_KEY_MODE]['value'] = vjNormalisasi($config[VJ_KEY_MODE]['value']);
         }
         jsonResponse($config);
         break;
@@ -1655,8 +1689,32 @@ switch ($action) {
             }
         }
 
+        // Mode verifikasi jurnal (verifikasi_jurnal.php): validasi nilai; MANUAL → OTOMATIS dengan
+        // jurnal Pending butuh konfirmasi (409), lalu semua Pending disahkan dalam transaksi yang sama.
+        vjPastikanMigrasi($db);
+        $konfirmasiVerif = ($body['konfirmasi_verifikasi'] ?? $updates['konfirmasi_verifikasi'] ?? false) === true;
+        unset($updates['konfirmasi_verifikasi'], $updates[VJ_KEY_MIGRASI]);
+        $sahkanPending = false;
+        if (array_key_exists(VJ_KEY_MODE, $updates)) {
+            $modeBaru = vjNormalisasi($updates[VJ_KEY_MODE]);
+            if ($modeBaru === '') errorResponse('Mode verifikasi jurnal tidak valid.');
+            $updates[VJ_KEY_MODE] = $modeBaru;
+            if ($modeBaru === 'OTOMATIS') {
+                $modeLama = vjMode($db);
+                $pending = vjHitungPending($db);
+                if ($modeLama !== 'OTOMATIS' && $pending > 0 && !$konfirmasiVerif) {
+                    jsonResponse([
+                        'error' => "Ada $pending jurnal yang belum diverifikasi. Konfirmasi untuk mengesahkan semuanya.",
+                        'peringatan_verifikasi' => ['pending' => $pending, 'dari' => $modeLama, 'ke' => 'OTOMATIS'],
+                    ], 409);
+                }
+                $sahkanPending = true;
+            }
+        }
+
         $db->begin_transaction();
         try {
+            if ($sahkanPending) vjSahkanPending($db);
             foreach ($updates as $key => $value) {
                 if (empty($key) || is_array($value)) continue;
                 $valStr = (string)$value;
@@ -1666,6 +1724,9 @@ switch ($action) {
             }
             if (isset($updates['school_level'])) {
                 $db->query("UPDATE system_config SET description = 'Jenjang sekolah (SD/SMP/SMA/SMK)' WHERE config_key = 'school_level' AND (description IS NULL OR description = '')");
+            }
+            if (isset($updates[VJ_KEY_MODE])) {
+                $db->query("UPDATE system_config SET description = 'Mode verifikasi jurnal (OTOMATIS/MANUAL)' WHERE config_key = '" . VJ_KEY_MODE . "' AND (description IS NULL OR description = '' OR description = 'Bawaan')");
             }
             $db->commit();
             jsonResponse(['success' => true]);

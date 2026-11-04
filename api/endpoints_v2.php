@@ -178,6 +178,7 @@ switch ($action) {
 
     // --- CONFIG & SYSTEM ---
     case 'get_config':
+        vjPastikanMigrasi($db);
         $res = $db->query("SELECT * FROM system_config");
         $config = [];
         while ($row = $res->fetch_assoc()) {
@@ -187,6 +188,8 @@ switch ($action) {
         $jenjang = jenjangAktif($db);
         $config['school_level'] = $jenjang['jenjang'];
         $config['school_level_sumber'] = $jenjang['sumber'];
+        // Mode verifikasi jurnal efektif (verifikasi_jurnal.php)
+        $config[VJ_KEY_MODE] = vjMode($db);
         jsonResponse($config);
         break;
 
@@ -197,7 +200,11 @@ switch ($action) {
         $val = $body['config_value'] ?? '';
         
         if(empty($key)) errorResponse('Key required');
-        
+        // Mode verifikasi jurnal hanya lewat save_system_config (validasi + konfirmasi + migrasi)
+        if (in_array($key, [VJ_KEY_MODE, VJ_KEY_MIGRASI], true)) {
+            errorResponse('Gunakan Pengaturan Sistem untuk mengubah mode verifikasi jurnal.');
+        }
+
         $stmt = $db->prepare("UPDATE system_config SET config_value = ? WHERE config_key = ?");
         $stmt->bind_param("ss", $val, $key);
         if ($stmt->execute()) jsonResponse(['success' => true]);

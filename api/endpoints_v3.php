@@ -762,10 +762,16 @@ switch ($action) {
         $stmt->execute();
         $jurnalMinggu = (int)$stmt->get_result()->fetch_assoc()['c'];
 
-        // Jurnal yang belum diverifikasi kepala sekolah.
-        $stmt = $db->prepare("SELECT COUNT(*) AS c FROM journal_entries WHERE isVerified = 0");
-        $stmt->execute();
-        $belumVerifikasi = (int)$stmt->get_result()->fetch_assoc()['c'];
+        // Jurnal yang belum diverifikasi kepala sekolah. Mode OTOMATIS: tidak ada yang perlu
+        // diverifikasi (lihat verifikasi_jurnal.php).
+        vjPastikanMigrasi($db);
+        $modeVerifikasi = vjMode($db);
+        $belumVerifikasi = 0;
+        if ($modeVerifikasi !== 'OTOMATIS') {
+            $stmt = $db->prepare("SELECT COUNT(*) AS c FROM journal_entries WHERE isVerified = 0");
+            $stmt->execute();
+            $belumVerifikasi = (int)$stmt->get_result()->fetch_assoc()['c'];
+        }
 
         // Tanggal jurnal terakhir, berguna saat hari ini masih kosong.
         $stmt = $db->prepare("SELECT MAX(date) AS d FROM journal_entries");
@@ -785,6 +791,7 @@ switch ($action) {
             'jurnal_hari_ini'         => $jurnalHari,
             'jurnal_7_hari'           => $jurnalMinggu,
             'jurnal_belum_verifikasi' => $belumVerifikasi,
+            'mode_verifikasi_jurnal'  => $modeVerifikasi,
             'jurnal_terakhir'         => $jurnalTerakhir ?: null,
         ]);
         break;

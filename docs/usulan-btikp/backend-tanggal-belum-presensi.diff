@@ -1,0 +1,259 @@
+diff --git a/api/endpoints_v2.php b/api/endpoints_v2.php
+index 8dd974b..64a3d4d 100644
+--- a/api/endpoints_v2.php
++++ b/api/endpoints_v2.php
+@@ -190,6 +190,8 @@ switch ($action) {
+         $config['school_level_sumber'] = $jenjang['sumber'];
+         // Mode verifikasi jurnal efektif (verifikasi_jurnal.php)
+         $config[VJ_KEY_MODE] = vjMode($db);
++        // Hari sekolah per minggu efektif (presensi_kosong.php)
++        $config[PK_KEY_HARI] = (string)pkHariSekolah($db);
+         jsonResponse($config);
+         break;
+ 
+@@ -204,6 +206,9 @@ switch ($action) {
+         if (in_array($key, [VJ_KEY_MODE, VJ_KEY_MIGRASI], true)) {
+             errorResponse('Gunakan Pengaturan Sistem untuk mengubah mode verifikasi jurnal.');
+         }
++        if ($key === PK_KEY_HARI) {
++            errorResponse('Gunakan Pengaturan Sistem untuk mengubah hari sekolah.');
++        }
+ 
+         $stmt = $db->prepare("UPDATE system_config SET config_value = ? WHERE config_key = ?");
+         $stmt->bind_param("ss", $val, $key);
+diff --git a/api/endpoints_v3.php b/api/endpoints_v3.php
+index 54762dc..3ce0aa8 100644
+--- a/api/endpoints_v3.php
++++ b/api/endpoints_v3.php
+@@ -170,6 +170,8 @@ switch ($action) {
+             'per_siswa'    => $perSiswa,
+             'per_bulan'    => $perBulan,
+             'ekskul'       => $ekskul,
++            // Tanggal Senin–Sabtu tanpa presensi kelas ini (lihat api/presensi_kosong.php)
++            'presensi_kosong' => presensiTanggalKosong($db, $classRef, $academicYear, $semester),
+         ]);
+         break;
+ 
+diff --git a/api/index.php b/api/index.php
+index 7e6b98a..90221a8 100644
+--- a/api/index.php
++++ b/api/index.php
+@@ -41,6 +41,7 @@ require_once __DIR__ . '/lesson_access.php';
+ require_once __DIR__ . '/teacher_subject_access.php';
+ require_once __DIR__ . '/jadwal_kbm.php';
+ require_once __DIR__ . '/rekap_bulanan.php';
++require_once __DIR__ . '/presensi_kosong.php';
+ require_once __DIR__ . '/pantau_nilai.php';
+ require_once __DIR__ . '/presensi_harian.php';
+ require_once __DIR__ . '/dispensasi.php';
+@@ -1659,6 +1660,10 @@ switch ($action) {
+         } else {
+             $config[VJ_KEY_MODE]['value'] = vjNormalisasi($config[VJ_KEY_MODE]['value']);
+         }
++        // Hari sekolah per minggu (presensi_kosong.php): selalu kirim nilai efektif (5/6, bawaan 6)
++        if (pkNormalisasiHari($config[PK_KEY_HARI]['value'] ?? '') === 0) {
++            $config[PK_KEY_HARI] = ['value' => (string)PK_HARI_DEFAULT, 'description' => 'Bawaan'];
++        }
+         jsonResponse($config);
+         break;
+ 
+@@ -1712,6 +1717,13 @@ switch ($action) {
+             }
+         }
+ 
++        // Hari sekolah per minggu: hanya '5' (Senin–Jumat) atau '6' (Senin–Sabtu)
++        if (array_key_exists(PK_KEY_HARI, $updates)) {
++            $hariBaru = pkNormalisasiHari($updates[PK_KEY_HARI]);
++            if ($hariBaru === 0) errorResponse('Hari sekolah harus 5 (Senin–Jumat) atau 6 (Senin–Sabtu).');
++            $updates[PK_KEY_HARI] = (string)$hariBaru;
++        }
++
+         $db->begin_transaction();
+         try {
+             if ($sahkanPending) vjSahkanPending($db);
+@@ -1725,6 +1737,9 @@ switch ($action) {
+             if (isset($updates['school_level'])) {
+                 $db->query("UPDATE system_config SET description = 'Jenjang sekolah (SD/SMP/SMA/SMK)' WHERE config_key = 'school_level' AND (description IS NULL OR description = '')");
+             }
++            if (isset($updates[PK_KEY_HARI])) {
++                $db->query("UPDATE system_config SET description = 'Hari sekolah per minggu (5 = Senin–Jumat, 6 = Senin–Sabtu)' WHERE config_key = '" . PK_KEY_HARI . "' AND (description IS NULL OR description = '' OR description = 'Bawaan')");
++            }
+             if (isset($updates[VJ_KEY_MODE])) {
+                 $db->query("UPDATE system_config SET description = 'Mode verifikasi jurnal (OTOMATIS/MANUAL)' WHERE config_key = '" . VJ_KEY_MODE . "' AND (description IS NULL OR description = '' OR description = 'Bawaan')");
+             }
+diff --git a/api/presensi_kosong.php b/api/presensi_kosong.php
+new file mode 100644
+index 0000000..db90fed
+--- /dev/null
++++ b/api/presensi_kosong.php
+@@ -0,0 +1,131 @@
++<?php
++// presensi_kosong.php — Tanggal yang belum ada pengisian presensi untuk Dashboard Kelas (wali kelas).
++// Dipakai oleh get_homeroom_dashboard (api/endpoints_v3.php), tidak punya action sendiri.
++// Dokumentasi patch: docs/patches/tanggal-belum-presensi.md
++if (!defined('SIMANTAP_API')) { http_response_code(403); exit('Forbidden'); }
++
++// Hari sekolah per minggu (system_config, diatur ADMIN lewat save_system_config):
++// '5' = Senin–Jumat, '6' = Senin–Sabtu. Key belum ada/tidak valid → 6 (perilaku lama).
++const PK_KEY_HARI     = 'school_days_per_week';
++const PK_HARI_DEFAULT = 6;
++
++/** Normalisasi nilai hari sekolah: 5 atau 6, selain itu 0 (tidak valid). */
++function pkNormalisasiHari($nilai): int
++{
++    $v = is_scalar($nilai) ? trim((string)$nilai) : '';
++    return in_array($v, ['5', '6'], true) ? (int)$v : 0;
++}
++
++/** Hari sekolah efektif (5 atau 6). */
++function pkHariSekolah(mysqli $db): int
++{
++    $stmt = $db->prepare("SELECT config_value FROM system_config WHERE config_key = ? LIMIT 1");
++    $key = PK_KEY_HARI;
++    $stmt->bind_param('s', $key);
++    $stmt->execute();
++    $row = $stmt->get_result()->fetch_assoc();
++    return pkNormalisasiHari($row['config_value'] ?? '') ?: PK_HARI_DEFAULT;
++}
++
++/** Apakah tanggal termasuk hari sekolah (Minggu selalu libur, Sabtu libur bila 5 hari). */
++function pkHariMasuk(DateTimeInterface $tgl, int $hariSekolah): bool
++{
++    return (int)$tgl->format('N') <= $hariSekolah;
++}
++
++/** Label rentang hari untuk teks: "Senin–Jumat" / "Senin–Sabtu". */
++function pkLabelHari(int $hariSekolah): string
++{
++    return $hariSekolah === 5 ? 'Senin–Jumat' : 'Senin–Sabtu';
++}
++
++/**
++ * Rentang tanggal semester dari tahun ajaran "2026/2027".
++ * GANJIL = 1 Juli – 31 Desember tahun pertama, GENAP = 1 Januari – 30 Juni tahun kedua.
++ * Hasil: [mulai, selesai] (Y-m-d) atau null bila format tahun ajaran tidak dikenali.
++ */
++function pkRentangSemester(string $tahunAjaran, string $semester): ?array
++{
++    if (!preg_match('/(\d{4})\s*\/\s*(\d{4})/', $tahunAjaran, $m)) return null;
++    return $semester === 'GANJIL'
++        ? [$m[1] . '-07-01', $m[1] . '-12-31']
++        : [$m[2] . '-01-01', $m[2] . '-06-30'];
++}
++
++/**
++ * Daftar tanggal hari sekolah di semester (s.d. hari ini) yang belum ada presensi untuk kelas ini.
++ *
++ * - Hari sekolah mengikuti pengaturan ADMIN (school_days_per_week): 5 = Senin–Jumat, 6 = Senin–Sabtu.
++ * - Hitungan dimulai dari tanggal presensi pertama di sekolah pada semester itu (bukan 1 Juli/1 Januari),
++ *   agar masa libur sebelum semester dimulai tidak ikut terhitung.
++ * - Tanggal tanpa presensi di SELURUH kelas dipisahkan ke `kemungkinan_libur` (hari libur, Sabtu
++ *   di sekolah 5 hari, dsb.), bukan dianggap kelalaian kelas ini.
++ * - Presensi kelas dicocokkan lewat class_id atau class_name (kunci dinormalisasi), sama seperti rekap bulanan.
++ *
++ * Hasil: ['mulai', 'sampai', 'hari_ini', 'hari_sekolah', 'hari_dicek', 'tanggal' => [...], 'kemungkinan_libur' => [...]].
++ * `mulai` = null bila semester belum berjalan atau belum ada presensi sama sekali di sekolah.
++ */
++function presensiTanggalKosong(mysqli $db, array $classRef, string $tahunAjaran, string $semester): array
++{
++    $hariIni = date('Y-m-d');
++    $hariSekolah = pkHariSekolah($db);
++    $hasil = ['mulai' => null, 'sampai' => null, 'hari_ini' => $hariIni, 'hari_sekolah' => $hariSekolah,
++              'hari_dicek' => 0, 'tanggal' => [], 'kemungkinan_libur' => []];
++
++    $rentang = pkRentangSemester($tahunAjaran, $semester);
++    if (!$rentang || $hariIni < $rentang[0]) return $hasil;
++    $sampai = min($rentang[1], $hariIni);
++
++    // Tanggal presensi pertama di sekolah pada semester ini
++    $stmt = $db->prepare("SELECT MIN(date) AS mulai FROM attendance_records WHERE date BETWEEN ? AND ?");
++    $stmt->bind_param('ss', $rentang[0], $sampai);
++    $stmt->execute();
++    $mulai = $stmt->get_result()->fetch_assoc()['mulai'] ?? null;
++    if (!$mulai) return $hasil;
++
++    // Tanggal yang punya presensi di sekolah (kelas mana pun)
++    $stmt = $db->prepare("SELECT DISTINCT date FROM attendance_records WHERE date BETWEEN ? AND ?");
++    $stmt->bind_param('ss', $mulai, $sampai);
++    $stmt->execute();
++    $res = $stmt->get_result();
++    $adaSekolah = [];
++    while ($r = $res->fetch_assoc()) $adaSekolah[$r['date']] = true;
++
++    // Tanggal yang punya presensi di kelas ini
++    $keys = array_values(array_unique(array_filter(
++        [normalizeClassKey($classRef['id']), normalizeClassKey($classRef['name'])],
++        fn($k) => $k !== ''
++    )));
++    $adaKelas = [];
++    if ($keys) {
++        $ph  = implode(',', array_fill(0, count($keys), '?'));
++        $col = "REPLACE(REPLACE(REPLACE(REPLACE(LOWER(%s), ' ', ''), '_', ''), '-', ''), '.', '')";
++        $sql = "SELECT DISTINCT date FROM attendance_records
++                WHERE date BETWEEN ? AND ?
++                  AND (" . sprintf($col, 'class_id') . " IN ($ph) OR " . sprintf($col, 'class_name') . " IN ($ph))";
++        $params = array_merge([$mulai, $sampai], $keys, $keys);
++        $stmt = $db->prepare($sql);
++        $stmt->bind_param(str_repeat('s', count($params)), ...$params);
++        $stmt->execute();
++        $res = $stmt->get_result();
++        while ($r = $res->fetch_assoc()) $adaKelas[$r['date']] = true;
++    }
++
++    $tgl   = new DateTimeImmutable($mulai);
++    $akhir = new DateTimeImmutable($sampai);
++    while ($tgl <= $akhir) {
++        $d = $tgl->format('Y-m-d');
++        if (pkHariMasuk($tgl, $hariSekolah)) {
++            $hasil['hari_dicek']++;
++            if (!isset($adaKelas[$d])) {
++                if (isset($adaSekolah[$d])) $hasil['tanggal'][] = $d;
++                else $hasil['kemungkinan_libur'][] = $d;
++            }
++        }
++        $tgl = $tgl->modify('+1 day');
++    }
++
++    $hasil['mulai']  = $mulai;
++    $hasil['sampai'] = $sampai;
++    return $hasil;
++}
+diff --git a/api/rekap_bulanan.php b/api/rekap_bulanan.php
+index b9c6bdb..2ab7515 100644
+--- a/api/rekap_bulanan.php
++++ b/api/rekap_bulanan.php
+@@ -475,13 +475,15 @@ function handleCetakRekapBulanan(mysqli $db): void
+             $notices[] = "Hari efektif ($hariEfektif) lebih kecil dari hari presensi tercatat ($recordedCount). Periksa kembali isian hari efektif.";
+         }
+ 
+-        // Tanggal Senin–Sabtu tanpa presensi (hanya pratinjau)
++        // Tanggal hari sekolah tanpa presensi (hanya pratinjau). Hari sekolah 5/6 dari pengaturan ADMIN
++        // (api/presensi_kosong.php); fallback Senin–Sabtu bila helper tidak dimuat.
++        $hariSekolah = function_exists('pkHariSekolah') ? pkHariSekolah($db) : 6;
+         $missingDates = [];
+         $lastDay = $isCurrent ? (int)$now->format('j') : $daysInMonth;
+         $recordedSet = array_flip($data['recorded_dates']);
+         for ($d = 1; $d <= $lastDay; $d++) {
+             $date = $monthStart->setDate((int)$monthStart->format('Y'), (int)$monthStart->format('n'), $d);
+-            if ((int)$date->format('N') === 7) continue;
++            if ((int)$date->format('N') > $hariSekolah) continue;
+             if (!isset($recordedSet[$date->format('Y-m-d')])) $missingDates[] = $date->format('Y-m-d');
+         }
+ 
+@@ -506,6 +508,7 @@ function handleCetakRekapBulanan(mysqli $db): void
+             'tanggal_default' => $tanggalDefault,
+             'data'          => $data,
+             'missing_dates' => $missingDates,
++            'label_hari'    => $hariSekolah === 5 ? 'Senin–Jumat' : 'Senin–Sabtu',
+             'notices'       => $notices,
+             'printed_by'    => (string)$me['displayName'],
+             'printed_at'    => $now,
+@@ -643,7 +646,7 @@ function rekapRender(array $ctx): void
+     <p class="notice"><?= $e($n) ?></p>
+   <?php endforeach; ?>
+   <?php if ($ctx['missing_dates']): ?>
+-    <p class="missing"><b>Tanggal belum ada presensi</b> (Senin–Sabtu<?= $ctx['is_current'] ? ', s.d. hari ini' : '' ?>; abaikan bila hari libur):
++    <p class="missing"><b>Tanggal belum ada presensi</b> (<?= $e($ctx['label_hari']) ?><?= $ctx['is_current'] ? ', s.d. hari ini' : '' ?>; abaikan bila hari libur):
+       <?= $e(implode(', ', array_map(fn($d) => (int)substr($d, 8, 2), $ctx['missing_dates']))) ?> <?= $e(rekapBulanIndo($ctx['month'])) ?>.</p>
+   <?php endif; ?>
+ </div>

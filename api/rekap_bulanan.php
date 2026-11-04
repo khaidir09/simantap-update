@@ -475,13 +475,15 @@ function handleCetakRekapBulanan(mysqli $db): void
             $notices[] = "Hari efektif ($hariEfektif) lebih kecil dari hari presensi tercatat ($recordedCount). Periksa kembali isian hari efektif.";
         }
 
-        // Tanggal Senin–Sabtu tanpa presensi (hanya pratinjau)
+        // Tanggal hari sekolah tanpa presensi (hanya pratinjau). Hari sekolah 5/6 dari pengaturan ADMIN
+        // (api/presensi_kosong.php); fallback Senin–Sabtu bila helper tidak dimuat.
+        $hariSekolah = function_exists('pkHariSekolah') ? pkHariSekolah($db) : 6;
         $missingDates = [];
         $lastDay = $isCurrent ? (int)$now->format('j') : $daysInMonth;
         $recordedSet = array_flip($data['recorded_dates']);
         for ($d = 1; $d <= $lastDay; $d++) {
             $date = $monthStart->setDate((int)$monthStart->format('Y'), (int)$monthStart->format('n'), $d);
-            if ((int)$date->format('N') === 7) continue;
+            if ((int)$date->format('N') > $hariSekolah) continue;
             if (!isset($recordedSet[$date->format('Y-m-d')])) $missingDates[] = $date->format('Y-m-d');
         }
 
@@ -506,6 +508,7 @@ function handleCetakRekapBulanan(mysqli $db): void
             'tanggal_default' => $tanggalDefault,
             'data'          => $data,
             'missing_dates' => $missingDates,
+            'label_hari'    => $hariSekolah === 5 ? 'Senin–Jumat' : 'Senin–Sabtu',
             'notices'       => $notices,
             'printed_by'    => (string)$me['displayName'],
             'printed_at'    => $now,
@@ -643,7 +646,7 @@ function rekapRender(array $ctx): void
     <p class="notice"><?= $e($n) ?></p>
   <?php endforeach; ?>
   <?php if ($ctx['missing_dates']): ?>
-    <p class="missing"><b>Tanggal belum ada presensi</b> (Senin–Sabtu<?= $ctx['is_current'] ? ', s.d. hari ini' : '' ?>; abaikan bila hari libur):
+    <p class="missing"><b>Tanggal belum ada presensi</b> (<?= $e($ctx['label_hari']) ?><?= $ctx['is_current'] ? ', s.d. hari ini' : '' ?>; abaikan bila hari libur):
       <?= $e(implode(', ', array_map(fn($d) => (int)substr($d, 8, 2), $ctx['missing_dates']))) ?> <?= $e(rekapBulanIndo($ctx['month'])) ?>.</p>
   <?php endif; ?>
 </div>

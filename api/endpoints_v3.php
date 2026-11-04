@@ -170,6 +170,8 @@ switch ($action) {
             'per_siswa'    => $perSiswa,
             'per_bulan'    => $perBulan,
             'ekskul'       => $ekskul,
+            // Tanggal Senin–Sabtu tanpa presensi kelas ini (lihat api/presensi_kosong.php)
+            'presensi_kosong' => presensiTanggalKosong($db, $classRef, $academicYear, $semester),
         ]);
         break;
 

@@ -190,6 +190,8 @@ switch ($action) {
         $config['school_level_sumber'] = $jenjang['sumber'];
         // Mode verifikasi jurnal efektif (verifikasi_jurnal.php)
         $config[VJ_KEY_MODE] = vjMode($db);
+        // Hari sekolah per minggu efektif (presensi_kosong.php)
+        $config[PK_KEY_HARI] = (string)pkHariSekolah($db);
         jsonResponse($config);
         break;
 
@@ -203,6 +205,9 @@ switch ($action) {
         // Mode verifikasi jurnal hanya lewat save_system_config (validasi + konfirmasi + migrasi)
         if (in_array($key, [VJ_KEY_MODE, VJ_KEY_MIGRASI], true)) {
             errorResponse('Gunakan Pengaturan Sistem untuk mengubah mode verifikasi jurnal.');
+        }
+        if ($key === PK_KEY_HARI) {
+            errorResponse('Gunakan Pengaturan Sistem untuk mengubah hari sekolah.');
         }
 
         $stmt = $db->prepare("UPDATE system_config SET config_value = ? WHERE config_key = ?");

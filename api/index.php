@@ -41,6 +41,7 @@ require_once __DIR__ . '/lesson_access.php';
 require_once __DIR__ . '/teacher_subject_access.php';
 require_once __DIR__ . '/jadwal_kbm.php';
 require_once __DIR__ . '/rekap_bulanan.php';
+require_once __DIR__ . '/presensi_kosong.php';
 require_once __DIR__ . '/pantau_nilai.php';
 require_once __DIR__ . '/presensi_harian.php';
 require_once __DIR__ . '/dispensasi.php';
@@ -1659,6 +1660,10 @@ switch ($action) {
         } else {
             $config[VJ_KEY_MODE]['value'] = vjNormalisasi($config[VJ_KEY_MODE]['value']);
         }
+        // Hari sekolah per minggu (presensi_kosong.php): selalu kirim nilai efektif (5/6, bawaan 6)
+        if (pkNormalisasiHari($config[PK_KEY_HARI]['value'] ?? '') === 0) {
+            $config[PK_KEY_HARI] = ['value' => (string)PK_HARI_DEFAULT, 'description' => 'Bawaan'];
+        }
         jsonResponse($config);
         break;
 
@@ -1712,6 +1717,13 @@ switch ($action) {
             }
         }
 
+        // Hari sekolah per minggu: hanya '5' (Senin–Jumat) atau '6' (Senin–Sabtu)
+        if (array_key_exists(PK_KEY_HARI, $updates)) {
+            $hariBaru = pkNormalisasiHari($updates[PK_KEY_HARI]);
+            if ($hariBaru === 0) errorResponse('Hari sekolah harus 5 (Senin–Jumat) atau 6 (Senin–Sabtu).');
+            $updates[PK_KEY_HARI] = (string)$hariBaru;
+        }
+
         $db->begin_transaction();
         try {
             if ($sahkanPending) vjSahkanPending($db);
@@ -1724,6 +1736,9 @@ switch ($action) {
             }
             if (isset($updates['school_level'])) {
                 $db->query("UPDATE system_config SET description = 'Jenjang sekolah (SD/SMP/SMA/SMK)' WHERE config_key = 'school_level' AND (description IS NULL OR description = '')");
+            }
+            if (isset($updates[PK_KEY_HARI])) {
+                $db->query("UPDATE system_config SET description = 'Hari sekolah per minggu (5 = Senin–Jumat, 6 = Senin–Sabtu)' WHERE config_key = '" . PK_KEY_HARI . "' AND (description IS NULL OR description = '' OR description = 'Bawaan')");
             }
             if (isset($updates[VJ_KEY_MODE])) {
                 $db->query("UPDATE system_config SET description = 'Mode verifikasi jurnal (OTOMATIS/MANUAL)' WHERE config_key = '" . VJ_KEY_MODE . "' AND (description IS NULL OR description = '' OR description = 'Bawaan')");

@@ -123,6 +123,16 @@ switch ($action) {
             $row['izin']  = (int)$row['izin'];  $row['alfa']  = (int)$row['alfa'];
             $perSiswa[] = $row;
         }
+        // Guru wali tiap murid (guru_wali.php): hanya untuk pengguna yang login, karena action ini tidak mewajibkan login
+        if (getCurrentUser() && $perSiswa) {
+            $gwNama = guruWaliNamaPerMurid($db, array_column($perSiswa, 'student_id'));
+            foreach ($perSiswa as &$ps) {
+                $gw = $gwNama[(string)$ps['student_id']] ?? null;
+                $ps['guru_wali_uid']  = $gw['uid'] ?? null;
+                $ps['guru_wali_nama'] = $gw['nama'] ?? null;
+            }
+            unset($ps);
+        }
 
         // Total poin pelanggaran kelas (incidents.className menyimpan nama kelas, cocokkan via kunci)
         $stmtV = $db->prepare("SELECT COALESCE(SUM(points),0) AS total FROM incidents
@@ -439,6 +449,9 @@ switch ($action) {
 
         // Format, hak ubah email (khusus ADMIN), dan duplikat dicek sebelum menulis apa pun
         $emailLama = kgValidasiEmail($db, $uid, $email);
+
+        // Guru wali yang masih punya murid dampingan tidak boleh diubah perannya (guru_wali.php)
+        guruWaliCegahUbahRole($db, $uid, $role);
 
         $hashed = !empty($password) ? password_hash($password, PASSWORD_BCRYPT) : null;
 

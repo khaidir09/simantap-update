@@ -373,6 +373,8 @@ switch ($action) {
         $user = requireAuth();
         $id = $_GET['id'] ?? '';
         if (empty($id)) errorResponse('ID wajib diisi');
+        // Guru wali yang masih punya murid dampingan aktif tidak boleh dihapus (guru_wali.php)
+        guruWaliCegahHapusGuru($db, $id);
         $stmt = $db->prepare("DELETE FROM gtk_pegawai WHERE id=?");
         $stmt->bind_param("s", $id);
         if ($stmt->execute()) {

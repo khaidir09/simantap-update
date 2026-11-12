@@ -53,6 +53,7 @@ require_once __DIR__ . '/verifikasi_jurnal.php';
 require_once __DIR__ . '/kelola_guru.php';
 require_once __DIR__ . '/bimbingan_pkl.php';
 require_once __DIR__ . '/profil_murid.php';
+require_once __DIR__ . '/guru_wali.php';
 
 $action = $_GET['action'] ?? '';
 
@@ -244,6 +245,9 @@ switch ($action) {
 
         $hashed = !empty($password) ? password_hash($password, PASSWORD_BCRYPT) : null;
 
+        // Guru wali yang masih punya murid dampingan tidak boleh diubah perannya (guru_wali.php)
+        guruWaliCegahUbahRole($db, $uid, $role);
+
         // Check if user already exists
         $stmt = $db->prepare("SELECT uid FROM users WHERE uid = ?");
         $stmt->bind_param("s", $uid);
@@ -296,6 +300,9 @@ switch ($action) {
         requireRole(['ADMIN', 'KEPALA_SEKOLAH']);
         $uid = $_GET['uid'] ?? '';
         if (empty($uid)) errorResponse('UID wajib disertakan');
+
+        // Guru wali yang masih punya murid dampingan aktif tidak boleh dihapus (guru_wali.php)
+        guruWaliCegahHapusGuru($db, $uid);
 
         // Fetch user email first to clean up teacher_registry
         $stmt = $db->prepare("SELECT email FROM users WHERE uid = ?");
@@ -1665,6 +1672,10 @@ switch ($action) {
         if (pkNormalisasiHari($config[PK_KEY_HARI]['value'] ?? '') === 0) {
             $config[PK_KEY_HARI] = ['value' => (string)PK_HARI_DEFAULT, 'description' => 'Bawaan'];
         }
+        // Ambang murid dampingan per guru wali (guru_wali.php): selalu kirim nilai efektif (1–100, bawaan 20)
+        if (guruWaliKuotaValid($config[GW_KEY_KUOTA]['value'] ?? null) === null) {
+            $config[GW_KEY_KUOTA] = ['value' => (string)GW_KUOTA_DEFAULT, 'description' => 'Bawaan'];
+        }
         jsonResponse($config);
         break;
 
@@ -1718,6 +1729,13 @@ switch ($action) {
             }
         }
 
+        // Ambang peringatan murid dampingan per guru wali (guru_wali.php): bilangan bulat 1–100
+        if (array_key_exists(GW_KEY_KUOTA, $updates)) {
+            $kuotaBaru = guruWaliKuotaValid($updates[GW_KEY_KUOTA]);
+            if ($kuotaBaru === null) errorResponse('Ambang murid dampingan per guru wali harus bilangan bulat 1–100.');
+            $updates[GW_KEY_KUOTA] = (string)$kuotaBaru;
+        }
+
         // Hari sekolah per minggu: hanya '5' (Senin–Jumat) atau '6' (Senin–Sabtu)
         if (array_key_exists(PK_KEY_HARI, $updates)) {
             $hariBaru = pkNormalisasiHari($updates[PK_KEY_HARI]);
@@ -1737,6 +1755,9 @@ switch ($action) {
             }
             if (isset($updates['school_level'])) {
                 $db->query("UPDATE system_config SET description = 'Jenjang sekolah (SD/SMP/SMA/SMK)' WHERE config_key = 'school_level' AND (description IS NULL OR description = '')");
+            }
+            if (isset($updates[GW_KEY_KUOTA])) {
+                $db->query("UPDATE system_config SET description = 'Ambang peringatan murid dampingan per guru wali' WHERE config_key = '" . GW_KEY_KUOTA . "' AND (description IS NULL OR description = '' OR description = 'Bawaan')");
             }
             if (isset($updates[PK_KEY_HARI])) {
                 $db->query("UPDATE system_config SET description = 'Hari sekolah per minggu (5 = Senin–Jumat, 6 = Senin–Sabtu)' WHERE config_key = '" . PK_KEY_HARI . "' AND (description IS NULL OR description = '' OR description = 'Bawaan')");
@@ -2423,6 +2444,18 @@ switch ($action) {
     case 'cetak_rekap_nilai_siswa':
         handleCetakRekapNilaiSiswa($db);
         break;
+
+    // --- GURU WALI: penugasan murid dampingan (docs/specs/penugasan-guru-wali.md) ---
+    case 'guru_wali_ringkasan':       handleGuruWaliRingkasan($db); break;
+    case 'guru_wali_murid':           handleGuruWaliMurid($db); break;
+    case 'guru_wali_tugaskan':        handleGuruWaliTugaskan($db); break;
+    case 'guru_wali_akhiri':          handleGuruWaliAkhiri($db); break;
+    case 'guru_wali_tutup_nonaktif':  handleGuruWaliTutupNonaktif($db); break;
+    case 'guru_wali_batalkan':        handleGuruWaliBatalkan($db); break;
+    case 'guru_wali_riwayat':         handleGuruWaliRiwayat($db); break;
+    case 'guru_wali_template':        handleGuruWaliTemplate($db); break;
+    case 'guru_wali_impor':           handleGuruWaliImpor($db); break;
+    case 'guru_wali_dampingan_saya':  handleGuruWaliDampinganSaya($db); break;
 
     // --- PROFIL MURID 360° (docs/specs/profil-murid-360.md) ---
     case 'profil_murid_daftar':

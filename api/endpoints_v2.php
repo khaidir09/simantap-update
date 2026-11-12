@@ -192,6 +192,8 @@ switch ($action) {
         $config[VJ_KEY_MODE] = vjMode($db);
         // Hari sekolah per minggu efektif (presensi_kosong.php)
         $config[PK_KEY_HARI] = (string)pkHariSekolah($db);
+        // Ambang murid dampingan per guru wali efektif (guru_wali.php)
+        $config[GW_KEY_KUOTA] = (string)guruWaliKuota($config[GW_KEY_KUOTA] ?? null);
         jsonResponse($config);
         break;
 
@@ -208,6 +210,9 @@ switch ($action) {
         }
         if ($key === PK_KEY_HARI) {
             errorResponse('Gunakan Pengaturan Sistem untuk mengubah hari sekolah.');
+        }
+        if ($key === GW_KEY_KUOTA) {
+            errorResponse('Gunakan Pengaturan Sistem untuk mengubah ambang guru wali.');
         }
 
         $stmt = $db->prepare("UPDATE system_config SET config_value = ? WHERE config_key = ?");

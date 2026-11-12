@@ -6,6 +6,7 @@
 if (!defined('SIMANTAP_API')) { http_response_code(403); exit('Forbidden'); }
 
 const PM_MSG_DENY      = 'Anda tidak memiliki akses ke Profil Murid.';
+const PM_MSG_BACA_SAJA = 'Guru wali hanya dapat melihat profil murid dampingan. Asesmen diisi oleh wali kelas atau guru BK.';
 const PM_MSG_404       = 'Murid tidak ditemukan.';
 const PM_MSG_SERVER    = 'Terjadi kesalahan pada server. Coba lagi atau hubungi admin.';
 const PM_MAKS_DAPODIK_BARIS = 2020;   // 2.000 baris data + baris judul/header
@@ -622,10 +623,37 @@ function profilMuridWajibMetode(string $metode): void
     }
 }
 
-/** Scope = Pantau Nilai (ALL: ADMIN, KS, GURU BK; CLASS: wali kelas; DENY: lainnya). */
+/**
+ * Scope = Pantau Nilai (ALL: ADMIN, KS, GURU BK; CLASS: wali kelas; DENY: lainnya), ditambah murid dampingan
+ * guru wali (guru_wali.php): 'dampinganIds' untuk GURU non-ALL; DENY + punya dampingan -> mode 'DAMPINGAN'.
+ * pantauNilaiScope sendiri tidak diubah (dipakai Pantau Nilai).
+ */
 function profilMuridScope(mysqli $db, array $sessionUser): array
 {
-    return pantauNilaiScope($db, $sessionUser);
+    $scope = pantauNilaiScope($db, $sessionUser);
+    $scope['dampinganIds'] = [];
+    if ($scope['mode'] === 'ALL' || !function_exists('guruWaliDampinganIds')) return $scope;
+    $fresh = loadFreshUser($db, $sessionUser);
+    if ($fresh['role'] !== 'GURU') return $scope;
+    $scope['dampinganIds'] = guruWaliDampinganIds($db, (string)$fresh['uid']);
+    if ($scope['mode'] === 'DENY' && $scope['dampinganIds']) {
+        $scope = ['mode' => 'DAMPINGAN', 'classKeys' => [], 'classId' => null, 'dampinganIds' => $scope['dampinganIds']];
+    }
+    return $scope;
+}
+
+/** Apakah murid dapat diakses lewat kelas perwalian (mode CLASS, murid aktif di kelas itu). */
+function profilMuridViaKelas(array $scope, array $m): bool
+{
+    if ($scope['mode'] !== 'CLASS') return false;
+    $diKelas = classInScope($scope, $m['class_id']) || classInScope($scope, $m['class_name']);
+    return $diKelas && profilMuridAktif($m['status']);
+}
+
+/** Hak tulis asesmen: ALL, atau wali kelas untuk murid aktif kelasnya. Akses lewat dampingan saja = baca. */
+function profilMuridBisaEditAsesmen(array $scope, array $m): bool
+{
+    return $scope['mode'] === 'ALL' || profilMuridViaKelas($scope, $m);
 }
 
 function profilMuridAktif(?string $status): bool
@@ -648,9 +676,9 @@ function profilMuridAmbilMurid(mysqli $db, array $scope, string $studentId, call
          FROM students WHERE id = ? LIMIT 1", 's', [$studentId]);
     if (!$rows) $fail(404, PM_MSG_404);
     $m = $rows[0];
-    if ($scope['mode'] === 'CLASS') {
-        $diKelas = classInScope($scope, $m['class_id']) || classInScope($scope, $m['class_name']);
-        if (!$diKelas || !profilMuridAktif($m['status'])) $fail(403, KESISWAAN_MSG_KELAS);
+    if ($scope['mode'] !== 'ALL') {
+        $viaDampingan = in_array((string)$m['id'], $scope['dampinganIds'] ?? [], true);
+        if (!profilMuridViaKelas($scope, $m) && !$viaDampingan) $fail(403, KESISWAAN_MSG_KELAS);
     }
     return $m;
 }
@@ -680,6 +708,8 @@ function profilMuridDalamTry(string $action, callable $fn): void
 function profilMuridKelas(mysqli $db, array $scope, string $raw): array
 {
     $raw = trim($raw);
+    // Guru wali tanpa kelas perwalian: daftar/template/impor per kelas tidak tersedia (pakai Murid Dampingan)
+    if ($scope['mode'] === 'DAMPINGAN') errorResponse('Gunakan menu Murid Dampingan untuk melihat murid dampingan Anda.', 403);
     if ($scope['mode'] === 'CLASS') {
         if ($raw === '') $raw = (string)$scope['classId'];
         elseif (!classInScope($scope, $raw)) errorResponse(KESISWAAN_MSG_KELAS, 403);
@@ -1002,7 +1032,8 @@ function profilMuridKumpulkan(mysqli $db, array $scope, array $m): array
     $period = getActiveAcademicPeriod($db);
     $ta = $period['academic_year'];
     $sem = strtoupper($period['semester']) === 'GENAP' ? 'GENAP' : 'GANJIL';
-    $samar = $scope['mode'] === 'CLASS';
+    // Semua akses selain ALL (wali kelas, guru wali) melihat NIK/KK tersamarkan
+    $samar = $scope['mode'] !== 'ALL';
     $murid = [
         'student_id'     => (string)$m['id'],
         'name'           => (string)$m['name'],
@@ -1024,7 +1055,7 @@ function profilMuridKumpulkan(mysqli $db, array $scope, array $m): array
         'pekerjaan_ortu' => $m['pekerjaan_ortu'],
     ];
     return [
-        'akses'         => ['mode' => $scope['mode'], 'bisa_edit_asesmen' => true, 'disamarkan' => $samar],
+        'akses'         => ['mode' => $scope['mode'], 'bisa_edit_asesmen' => profilMuridBisaEditAsesmen($scope, $m), 'disamarkan' => $samar],
         'periode_aktif' => ['academic_year' => $ta, 'semester' => $sem],
         'murid'         => $murid,
         'biodata'       => profilMuridBiodata($db, (string)$m['id'], $samar),
@@ -1033,6 +1064,8 @@ function profilMuridKumpulkan(mysqli $db, array $scope, array $m): array
         'kompetensi'    => ['tersedia' => false],
         'kehadiran'     => profilMuridKehadiran($db, $m, $ta, $sem),
         'riwayat'       => profilMuridRiwayat($db, $m, $ta),
+        'guru_wali'     => function_exists('guruWaliUntukProfil')
+            ? guruWaliUntukProfil($db, (string)$m['id'], profilMuridAktif($m['status'])) : ['aktif' => null, 'riwayat' => []],
     ];
 }
 
@@ -1179,6 +1212,7 @@ function handleProfilMuridAsesmenSimpan(mysqli $db): void
     profilMuridDalamTry('profil_murid_asesmen_simpan', function () use ($db, $scope, $user) {
         $body = getRequestBody();
         $m = profilMuridAmbilMurid($db, $scope, trim((string)($body['student_id'] ?? '')), fn(int $s, string $msg) => errorResponse($msg, $s));
+        if (!profilMuridBisaEditAsesmen($scope, $m)) errorResponse(PM_MSG_BACA_SAJA, 403);
         [$ta, $sem] = profilMuridSemesterTulis($db, $body['semester'] ?? '');
         $v = profilMuridValidasiAsesmen($body);
         if ($v['kosong']) errorResponse('Isi minimal satu data asesmen atau rencana karir.', 400);
@@ -1203,6 +1237,7 @@ function handleProfilMuridAsesmenHapus(mysqli $db): void
     profilMuridDalamTry('profil_murid_asesmen_hapus', function () use ($db, $scope, $user) {
         $body = getRequestBody();
         $m = profilMuridAmbilMurid($db, $scope, trim((string)($body['student_id'] ?? '')), fn(int $s, string $msg) => errorResponse($msg, $s));
+        if (!profilMuridBisaEditAsesmen($scope, $m)) errorResponse(PM_MSG_BACA_SAJA, 403);
         $period = getActiveAcademicPeriod($db);
         $ta = trim((string)($body['academic_year'] ?? ''));
         if ($ta !== $period['academic_year']) errorResponse('Hanya data asesmen tahun ajaran aktif yang dapat dihapus.', 400);
@@ -1667,6 +1702,7 @@ function profilMuridRender(array $d, array $kop, ?array $wali, string $pencetak)
       <tr><td class="k">NISN / NIPD</td><td>: <?= $e($isi($m['nisn'])) ?> / <?= $e($isi($b['nipd'] ?? null)) ?></td></tr>
       <tr><td class="k">Kelas</td><td>: <?= $e($m['class_name']) ?><?= $m['aktif'] ? '' : ' (' . $e(rekapStudentStatusLabel($m['status'])) . ')' ?></td></tr>
       <tr><td class="k">Wali Kelas</td><td>: <?= $e($wali['displayName'] ?? '-') ?></td></tr>
+      <tr><td class="k">Guru Wali</td><td>: <?= $e(($d['guru_wali']['aktif'] ?? null) ? $d['guru_wali']['aktif']['guru_nama'] . ' (sejak ' . rekapTanggalIndo($d['guru_wali']['aktif']['tanggal_mulai']) . ')' : '-') ?></td></tr>
       <tr><td class="k">Tahun Ajaran / Semester</td><td>: <?= $e($d['periode_aktif']['academic_year'] . ' / ' . $semLabel) ?></td></tr>
     </table>
   </td><td class="foto"><?php if ($foto !== ''): ?><img src="<?= $e($foto) ?>" alt="" onerror="this.style.visibility='hidden'"><?php endif; ?></td></tr></table>

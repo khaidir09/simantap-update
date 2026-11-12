@@ -238,10 +238,12 @@ function pantauNilaiSummary(array $tugas, array $kuis, array $ujian, int $missin
 /**
  * Inti pengumpulan data nilai satu kelas untuk satu semester TA aktif (dipakai ketiga action).
  * $forceSubject: kode mapel yang selalu dimasukkan ke daftar mapel (untuk detail mapel).
+ * $studentsOverride: daftar siswa pengganti (format pantauNilaiStudents), dipakai Profil Murid 360°
+ * untuk menghitung nilai semester lalu di kelas lama (docs/specs/profil-murid-360.md §4.8).
  */
-function pantauNilaiCollect(mysqli $db, string $classId, string $academicYear, string $semester, ?string $forceSubject = null): array
+function pantauNilaiCollect(mysqli $db, string $classId, string $academicYear, string $semester, ?string $forceSubject = null, ?array $studentsOverride = null): array
 {
-    $students = pantauNilaiStudents($db, $classId);
+    $students = $studentsOverride ?? pantauNilaiStudents($db, $classId);
     $weights  = pantauNilaiWeights($db);
     $range    = getSemesterDateRange($academicYear, $semester);
 

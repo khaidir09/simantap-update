@@ -52,6 +52,7 @@ require_once __DIR__ . '/persetujuan_jurnal.php';
 require_once __DIR__ . '/verifikasi_jurnal.php';
 require_once __DIR__ . '/kelola_guru.php';
 require_once __DIR__ . '/bimbingan_pkl.php';
+require_once __DIR__ . '/profil_murid.php';
 
 $action = $_GET['action'] ?? '';
 
@@ -2421,6 +2422,39 @@ switch ($action) {
 
     case 'cetak_rekap_nilai_siswa':
         handleCetakRekapNilaiSiswa($db);
+        break;
+
+    // --- PROFIL MURID 360° (docs/specs/profil-murid-360.md) ---
+    case 'profil_murid_daftar':
+        handleProfilMuridDaftar($db);
+        break;
+
+    case 'profil_murid_get':
+        handleProfilMuridGet($db);
+        break;
+
+    case 'profil_murid_asesmen_simpan':
+        handleProfilMuridAsesmenSimpan($db);
+        break;
+
+    case 'profil_murid_asesmen_hapus':
+        handleProfilMuridAsesmenHapus($db);
+        break;
+
+    case 'profil_murid_asesmen_template':
+        handleProfilMuridAsesmenTemplate($db);
+        break;
+
+    case 'profil_murid_asesmen_impor':
+        handleProfilMuridAsesmenImpor($db);
+        break;
+
+    case 'profil_murid_dapodik_impor':
+        handleProfilMuridDapodikImpor($db);
+        break;
+
+    case 'cetak_profil_murid':
+        handleCetakProfilMurid($db);
         break;
 
     // --- PORTAL NILAI ORANG TUA: kelola PIN & saklar (docs/specs/portal-nilai-orang-tua.md) ---

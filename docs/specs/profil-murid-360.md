@@ -371,7 +371,7 @@ Upsert berdasarkan `(student_id, academic_year, semester)`. Data periode yang sa
 
 ## 5. Kontrak frontend (patch bundle)
 
-Skrip `docs/patches/apply-profil-murid-bundle.js` membaca `assets/index-CGWL69P7-harisekolah1.js`, menulis `assets/index-CGWL69P7-profilmurid1.js`, lalu mengganti rujukan di `app.html`. Aturan sama dengan patch sebelumnya: setiap anchor harus ditemukan **tepat sekali** (jika tidak, skrip berhenti), hanya kelas Tailwind yang sudah ada di `assets/index-CC1PBzaO.css`, komponen ditulis dengan `a.jsx`/`a.jsxs` dan `ue.useState`/`ue.useEffect` seperti `dot`.
+Skrip `docs/patches/apply-profil-murid-bundle.js` membaca `assets/index-CGWL69P7-harisekolah1.js`, menulis `assets/index-CGWL69P7-profilmurid2.js`, lalu mengganti rujukan di `app.html`. Aturan sama dengan patch sebelumnya: setiap anchor harus ditemukan **tepat sekali** (jika tidak, skrip berhenti), hanya kelas Tailwind yang sudah ada di `assets/index-CC1PBzaO.css`, komponen ditulis dengan `a.jsx`/`a.jsxs` dan `ue.useState`/`ue.useEffect` seperti `dot`.
 
 1. **State navigasi murid:** `window.__pmSid` + `sessionStorage['simantap_pm_sid']` (dibungkus try/catch) menyimpan `student_id` dan halaman asal. `n("profil-murid")` dipanggil setelah mengisinya. Router aplikasi tidak menyimpan halaman aktif, sehingga refresh kembali ke Dashboard.
 2. **Komponen `__ProfilMurid`** (`{user, studentId, onBack}`): memuat `profil_murid_get`, merender header + tujuh bagian §3.4, form edit asesmen (modal), dan tombol Cetak (`window.open(\`${API}?action=cetak_profil_murid&student_id=…\`, '_blank')`). Grafik memakai komponen recharts yang sudah ada di bundle (identifier minify dicari saat menulis patch); jika tidak bisa dijangkau dengan aman, fallback ke SVG inline sederhana. Galat (403/404) ditampilkan di kartu, bukan `alert`.
@@ -390,7 +390,7 @@ Skrip `docs/patches/apply-profil-murid-bundle.js` membaca `assets/index-CGWL69P7
 | `api/pantau_nilai.php` | Parameter opsional `$studentsOverride` di `pantauNilaiCollect` (§4.8) |
 | `api/kesiswaan_access.php`, `api/rekap_bulanan.php`, `api/db.php` | Dipakai ulang, tidak diubah (`loadFreshUser`, `studentInScope`, `resolveClassRef`, `KESISWAAN_MSG_KELAS`, `rekap*`, `getActiveAcademicPeriod`, `getSemesterDateRange`) |
 | `docs/patches/apply-profil-murid-bundle.js` (**baru**) | Patch bundle §5 |
-| `assets/index-CGWL69P7-profilmurid1.js` (**hasil generate**), `app.html` | Hasil skrip patch |
+| `assets/index-CGWL69P7-profilmurid2.js` (**hasil generate**), `app.html` | Hasil skrip patch |
 | `docs/patches/profil-murid-360.md` (**baru**) | Catatan patch: cara menerapkan, anchor, rollback (kembalikan `app.html` ke `harisekolah1`, hapus `require_once` + `case`, tabel baru boleh dibiarkan), prasyarat akun uji |
 | `docs/patches/uji-profil-murid-api.mjs` (**baru**) | Skrip uji API §10.1 |
 | `docs/patches/uji-profil-murid-unit.php` (**baru**) | Uji unit fungsi murni §10.2 |
@@ -473,14 +473,14 @@ php -l api/profil_murid.php
 php -l api/pantau_nilai.php
 php -l api/index.php
 node --check docs/patches/apply-profil-murid-bundle.js
-node --check assets/index-CGWL69P7-profilmurid1.js
+node --check assets/index-CGWL69P7-profilmurid2.js
 ```
 
 Uji Pantau Nilai yang ada (`docs/patches/uji-pantau-nilai-api.mjs`) dijalankan ulang dan tetap lulus.
 
 ### 10.4 Verifikasi end-to-end (manual, di browser)
 
-1. Jalankan skrip patch; `app.html` merujuk `profilmurid1`; aplikasi termuat tanpa error konsol.
+1. Jalankan skrip patch; `app.html` merujuk `profilmurid2`; aplikasi termuat tanpa error konsol.
 2. **TU:** Data Siswa → Impor Biodata Dapodik → pilih file ekspor Dapodik asli sekolah → pratinjau menampilkan jumlah per status dan kolom yang dibuang → Simpan → ringkasan cocok; unduh daftar tidak ditemukan.
 3. **Wali kelas:** Dashboard Kelas Saya → "Profil & Asesmen Kelas" → Unduh Template → isi 3 baris di Excel (satu baris salah NISN) → Impor → pratinjau (2 BARU, 1 GALAT) → Simpan.
 4. Klik nama murid di tabel rekap → profil terbuka: biodata (NIK tersamar), asesmen + grafik RIASEC, rencana karir, akademik + tren, slot kompetensi/target "Belum tersedia", kehadiran, tab riwayat. "← Kembali" → dashboard. (Refresh browser mengembalikan aplikasi ke Dashboard, sesuai perilaku router aplikasi; murid terakhir tetap tersimpan di `sessionStorage`.)

@@ -13,8 +13,8 @@
 | `api/index.php` | ubah: `require_once __DIR__ . '/profil_murid.php';` setelah `bimbingan_pkl.php`, dan 8 `case` sebelum blok Portal Nilai | `e0f97c52cc7197c3ea4f34325467bf1283ddc8b998bff593c94a1a763c9d6e20` |
 | `api/pantau_nilai.php` | ubah: parameter opsional `$studentsOverride` di `pantauNilaiCollect` (tanpa argumen itu perilaku tidak berubah) | `6aea755464830a276deef6fe5a9541fc9d4d361bdd47d960640043520ca3b0b1` |
 | `assets/index-CGWL69P7-harisekolah1.js` | **tidak diubah** (sumber patch) | `7a2edf32de2296dbcefbe2dae41986dc38bf763cf83b90225510a5c0808b4263` |
-| `assets/index-CGWL69P7-profilmurid1.js` | baru: salinan `-harisekolah1.js` dengan patch M0–M8 | `abe9baa433a1f197ef3ccb0a72ac61410ef137b71d004d9388dd21c87be79492` |
-| `app.html` | ubah: `<script src>` ke `index-CGWL69P7-profilmurid1.js` | `680ced211efb7532ecf2b9b8b56556c9e8f15381622356143348062c6a7960ce` |
+| `assets/index-CGWL69P7-profilmurid2.js` | baru: salinan `-harisekolah1.js` dengan patch M0–M8 | `abe9baa433a1f197ef3ccb0a72ac61410ef137b71d004d9388dd21c87be79492` |
+| `app.html` | ubah: `<script src>` ke `index-CGWL69P7-profilmurid2.js` | `dae1675c57deac6e68bb44292c10efeccac10af4134bd88b4e7d106952120a4c` |
 | `docs/patches/apply-profil-murid-bundle.js` | baru: skrip penerap patch bundle | – |
 | `docs/patches/uji-profil-murid-api.mjs` | baru: skrip uji API T1–T8 (92 pemeriksaan) | – |
 | `docs/patches/uji-profil-murid-unit.php` | baru: uji unit fungsi murni (56 pemeriksaan) | – |
@@ -69,7 +69,7 @@ Skrip ini:
 3. memastikan identifier bundle yang dipakai ada (ikon lucide, `C_`/`Jl`/`QC` SheetJS);
 4. memastikan **semua class Tailwind** (peta `KELAS` di skrip) ada di `assets/index-CC1PBzaO.css`;
 5. memastikan setiap anchor muncul **tepat 1 kali**;
-6. menulis `assets/index-CGWL69P7-profilmurid1.js` dan mengarahkan `app.html` ke file itu.
+6. menulis `assets/index-CGWL69P7-profilmurid2.js` dan mengarahkan `app.html` ke file itu.
 
 | Patch | Isi |
 |---|---|
@@ -86,7 +86,7 @@ NIK/tanggal tidak diformat ulang); pemetaan kolom dan validasi tetap di PHP.
 
 ## 4. Rollback
 
-1. Kembalikan `app.html` ke `./assets/index-CGWL69P7-harisekolah1.js` (hapus `index-CGWL69P7-profilmurid1.js` bila perlu).
+1. Kembalikan `app.html` ke `./assets/index-CGWL69P7-harisekolah1.js` (hapus `index-CGWL69P7-profilmurid2.js` bila perlu).
 2. Hapus `require_once __DIR__ . '/profil_murid.php';` dan 8 `case` Profil Murid dari `api/index.php`.
 3. Parameter `$studentsOverride` di `pantau_nilai.php` boleh dibiarkan (opsional, tidak mengubah perilaku).
 4. Tabel `student_biodata`, `student_asesmen`, `student_import_log` boleh dibiarkan. Perubahan kolom `students`
@@ -102,7 +102,7 @@ UJI_MYSQL="E:/laragon/bin/mysql/mysql-5.7.33-winx64/bin/mysql.exe -uroot simanta
 mysql -uroot simantap < docs/patches/uji-profil-murid-cleanup.sql
 php docs/patches/uji-profil-murid-unit.php
 php -l api/profil_murid.php && php -l api/pantau_nilai.php && php -l api/index.php
-node --check docs/patches/apply-profil-murid-bundle.js && node --check assets/index-CGWL69P7-profilmurid1.js
+node --check docs/patches/apply-profil-murid-bundle.js && node --check assets/index-CGWL69P7-profilmurid2.js
 ```
 
 Hasil 2026-11-12: API 92/92, unit 56/56, regresi Pantau Nilai (API 44/44, parser 14/14), lint lulus.
@@ -121,3 +121,16 @@ kolom dibuang; cetak A4 wali (NIK tersamar). Konsol tanpa error. Belum diuji: ta
   Perbaiki autentikasi kedua action itu sebelum impor Dapodik pertama di produksi.
 - Auto-updater portal dapat menimpa `app.html`, `api/index.php`, dan `api/pantau_nilai.php`; jalankan ulang
   skrip patch dan periksa `require_once`/`case` setelah update.
+
+## 7. Catatan deploy (Cloudflare)
+
+Produksi (`sim.smkn1amuntai.sch.id`) berada di belakang Cloudflare, yang menyimpan file `assets/*.js` selama
+7 hari (`cache-control: public, max-age=604800`). Pada deploy pertama (2026-11-12), file
+`index-CGWL69P7-profilmurid1.js` sempat diminta saat upload masih berjalan. Cloudflare menyimpan versi **0 byte**
+(`cf-cache-status: HIT`, `Last-Modified: 12:33:07 GMT`), sehingga aplikasi tampil putih tanpa pesan error.
+Purge URL tidak menghilangkannya, jadi bundle diganti nama menjadi `index-CGWL69P7-profilmurid2.js` (isi identik).
+
+Urutan deploy bundle berikutnya:
+1. Upload file bundle JS baru **sampai selesai** (mode binary), dengan nama file yang belum pernah dipakai.
+2. Periksa `https://<domain>/assets/<nama-bundle>.js` di browser: ukurannya harus sama dengan file lokal.
+3. Baru upload `app.html`.

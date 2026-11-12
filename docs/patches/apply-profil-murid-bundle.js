@@ -20,7 +20,7 @@ const crypto = require('crypto');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const SRC_NAME = 'index-CGWL69P7-harisekolah1.js';
-const OUT_NAME = 'index-CGWL69P7-profilmurid1.js';
+const OUT_NAME = 'index-CGWL69P7-profilmurid2.js';
 const SRC_SHA256 = '7a2edf32de2296dbcefbe2dae41986dc38bf763cf83b90225510a5c0808b4263';
 const CSS_NAME = 'index-CC1PBzaO.css';
 

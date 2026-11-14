@@ -54,6 +54,7 @@ require_once __DIR__ . '/kelola_guru.php';
 require_once __DIR__ . '/bimbingan_pkl.php';
 require_once __DIR__ . '/profil_murid.php';
 require_once __DIR__ . '/guru_wali.php';
+require_once __DIR__ . '/instrumen_guru_wali.php';
 
 $action = $_GET['action'] ?? '';
 
@@ -2456,6 +2457,9 @@ switch ($action) {
     case 'guru_wali_template':        handleGuruWaliTemplate($db); break;
     case 'guru_wali_impor':           handleGuruWaliImpor($db); break;
     case 'guru_wali_dampingan_saya':  handleGuruWaliDampinganSaya($db); break;
+
+    // --- INSTRUMEN GURU WALI: impor Google Form (docs/specs/impor-instrumen-guru-wali.md) ---
+    case 'instrumen_gw_impor':        handleInstrumenGwImpor($db); break;
 
     // --- PROFIL MURID 360° (docs/specs/profil-murid-360.md) ---
     case 'profil_murid_daftar':

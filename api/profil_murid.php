@@ -612,6 +612,8 @@ function profilMuridPastikanTabel(mysqli $db): void
         `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
         PRIMARY KEY (`id`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    // Kolom/tabel instrumen Guru Wali (instrumen_guru_wali.php)
+    if (function_exists('instrumenGwPastikanSkema')) instrumenGwPastikanSkema($db);
     $sudah = true;
 }
 
@@ -792,10 +794,12 @@ function profilMuridBiodata(mysqli $db, string $sid, bool $samar): ?array
 
 function profilMuridBarisAsesmen(array $r): array
 {
-    foreach (['riasec_r', 'riasec_i', 'riasec_a', 'riasec_s', 'riasec_e', 'riasec_c', 'skor_visual', 'skor_auditori', 'skor_kinestetik'] as $f) {
-        $r[$f] = $r[$f] !== null ? (float)$r[$f] : null;
+    foreach (['riasec_r', 'riasec_i', 'riasec_a', 'riasec_s', 'riasec_e', 'riasec_c', 'skor_visual', 'skor_auditori', 'skor_kinestetik',
+              'kompetensi_r', 'kompetensi_i', 'kompetensi_a', 'kompetensi_s', 'kompetensi_e', 'kompetensi_c'] as $f) {
+        $r[$f] = isset($r[$f]) ? (float)$r[$f] : null;
     }
-    foreach (['mapel_termudah', 'mapel_tersulit'] as $f) {
+    // Kolom JSON (kegiatan_dikuasai, mapel_pilihan, mapel_pendukung dari instrumen Guru Wali)
+    foreach (['mapel_termudah', 'mapel_tersulit', 'kegiatan_dikuasai', 'mapel_pilihan', 'mapel_pendukung'] as $f) {
         $d = json_decode((string)($r[$f] ?? ''), true);
         $r[$f] = is_array($d) ? array_values($d) : [];
     }
@@ -1066,6 +1070,9 @@ function profilMuridKumpulkan(mysqli $db, array $scope, array $m): array
         'riwayat'       => profilMuridRiwayat($db, $m, $ta),
         'guru_wali'     => function_exists('guruWaliUntukProfil')
             ? guruWaliUntukProfil($db, (string)$m['id'], profilMuridAktif($m['status'])) : ['aktif' => null, 'riwayat' => []],
+        // Respons Formulir Awal Murid Guru Wali (jawaban mentah), terbaru dulu
+        'instrumen'     => function_exists('instrumenGwUntukProfil') && profilMuridTabelAda($db, 'student_instrumen_respons')
+            ? instrumenGwUntukProfil($db, (string)$m['id']) : [],
     ];
 }
 
@@ -1740,6 +1747,11 @@ function profilMuridRender(array $d, array $kop, ?array $wali, string $pencetak)
     <tr><td class="k">Kesulitan belajar</td><td>: <?= $e($isi($a['kesulitan_belajar'])) ?></td></tr>
     <tr><td class="k">Mapel termudah</td><td>: <?= $e($a['mapel_termudah'] ? implode(', ', $a['mapel_termudah']) : '-') ?></td></tr>
     <tr><td class="k">Mapel tersulit</td><td>: <?= $e($a['mapel_tersulit'] ? implode(', ', $a['mapel_tersulit']) : '-') ?></td></tr>
+    <?php if (($a['kompetensi_kode'] ?? null) !== null): ?>
+    <tr><td class="k">Kompetensi RIASEC</td><td>: <b><?= $e($a['kompetensi_kode']) ?></b> (<?= $e(implode(', ', array_map(fn($h) => strtoupper($h) . ' ' . $n($a['kompetensi_' . $h]), ['r', 'i', 'a', 's', 'e', 'c']))) ?>)</td></tr>
+    <?php endif; ?>
+    <tr><td class="k">Bakat/keterampilan</td><td>: <?= $e($isi($a['bakat'] ?? null)) ?></td></tr>
+    <tr><td class="k">Ingin ditingkatkan</td><td>: <?= $e($isi($a['keterampilan_target'] ?? null)) ?></td></tr>
   </table>
   <?php endif; ?>
 
@@ -1748,6 +1760,7 @@ function profilMuridRender(array $d, array $kop, ?array $wali, string $pencetak)
     <tr><td class="k">Cita-cita</td><td>: <?= $e($isi($a['cita_cita'] ?? null)) ?></td></tr>
     <tr><td class="k">Rencana setelah lulus</td><td>: <?= $e(($a['rencana_lulus'] ?? null) ? PM_RENCANA_LABEL[$a['rencana_lulus']] : '-') ?></td></tr>
     <tr><td class="k">Jurusan / Institusi tujuan</td><td>: <?= $e($isi($a['jurusan_tujuan'] ?? null)) ?> / <?= $e($isi($a['institusi_tujuan'] ?? null)) ?></td></tr>
+    <tr><td class="k">Alasan memilih rencana</td><td>: <?= $e($isi($a['alasan_rencana'] ?? null)) ?></td></tr>
     <tr><td class="k">Catatan</td><td>: <?= $e($isi($a['catatan_karir'] ?? null)) ?></td></tr>
   </table>
 

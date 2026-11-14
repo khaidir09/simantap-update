@@ -1071,9 +1071,12 @@ function handleGuruWaliDampinganSaya(mysqli $db): void
                                               'ss' . $tp, array_merge([$ta, $sem], $ids)) as $r) $asm[$r['student_id']] = true;
                 }
             }
+            // Respons Formulir Awal Murid periode aktif (instrumen_guru_wali.php)
+            $instrumen = function_exists('instrumenGwCapPerMurid') ? instrumenGwCapPerMurid($db, $ids, $ta, $sem) : [];
             foreach ($rows as $r) {
                 $sid = (string)$r['id'];
                 $murid[] = [
+                    'instrumen_cap_waktu' => $instrumen[$sid] ?? null,
                     'id' => $sid, 'student_id' => $sid, 'nisn' => (string)($r['nisn'] ?? ''), 'name' => (string)$r['name'],
                     'class_id' => (string)$r['class_id'], 'class_name' => (string)$r['class_name'], 'pas_foto' => $r['pas_foto'],
                     'tanggal_mulai' => (string)$r['tanggal_mulai'], 'total_violation_points' => (int)$r['total_violation_points'],
@@ -1081,6 +1084,7 @@ function handleGuruWaliDampinganSaya(mysqli $db): void
                 ];
             }
         }
-        jsonResponse(['guru' => $guru, 'periode_aktif' => ['academic_year' => $ta, 'semester' => $sem], 'murid' => $murid]);
+        jsonResponse(['guru' => $guru, 'periode_aktif' => ['academic_year' => $ta, 'semester' => $sem], 'murid' => $murid,
+                      'ringkasan' => ['instrumen_terisi' => count(array_filter($murid, fn($x) => $x['instrumen_cap_waktu'] !== null))]]);
     });
 }
